@@ -133,7 +133,7 @@ static bool is_admin() {
     PSID adminGroup = nullptr;
     SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
     if (AllocateAndInitializeSid(&ntAuth, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
-                                  0, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+                                  0, 0, 0, 0, 0, 0, &adminGroup)) {
         if (!CheckTokenMembership(nullptr, adminGroup, &isAdmin)) {
             isAdmin = FALSE;
         }
