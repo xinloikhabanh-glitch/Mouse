@@ -33,6 +33,7 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "advapi32.lib")
 
 namespace fs = std::filesystem;
 
