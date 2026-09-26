@@ -22,13 +22,13 @@ Xem chi tiết trong `build.md`. Tóm tắt:
 ```bat
 rem MSVC (Developer Command Prompt)
 rc /fo resource.res resource.rc
-cl /std:c++17 /EHsc /utf-8 /O2 /DUNICODE /D_UNICODE MouseForge.cpp resource.res /Fe:MouseForge.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comctl32.lib shlwapi.lib psapi.lib dwmapi.lib
+cl /std:c++17 /EHsc /utf-8 /O2 /DUNICODE /D_UNICODE MouseForge.cpp resource.res /Fe:MouseForge.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comctl32.lib shlwapi.lib psapi.lib dwmapi.lib advapi32.lib
 ```
 
 ```bash
 # MinGW-w64
 windres resource.rc -O coff -o resource.res
-g++ -std=c++17 -O2 -municode -mwindows MouseForge.cpp resource.res -o MouseForge.exe -lshlwapi -lpsapi -lcomctl32 -lgdi32 -luser32 -ldwmapi
+g++ -std=c++17 -O2 -municode -mwindows MouseForge.cpp resource.res -o MouseForge.exe -lshlwapi -lpsapi -lcomctl32 -lgdi32 -luser32 -ldwmapi -ladvapi32
 ```
 
 ## Lưu ý trung thực
