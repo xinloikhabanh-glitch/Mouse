@@ -1540,6 +1540,21 @@ static void ShowTabPage(int idx) {
 }
 
 // ===================== UI construction =====================
+// Duyệt toàn bộ control con, thêm style BS_FLAT cho mọi nút BUTTON để giao diện phẳng/hiện đại hơn.
+static BOOL CALLBACK FlattenButtonsProc(HWND hwnd, LPARAM) {
+    wchar_t cls[64];
+    GetClassNameW(hwnd, cls, 64);
+    if (lstrcmpiW(cls, L"Button") == 0) {
+        LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        // Chỉ thêm BS_FLAT cho pushbutton thường, không đụng tới checkbox (giữ khung ô vuông rõ ràng)
+        LONG_PTR btnType = style & 0xF; // BS_* nằm ở 4 bit thấp
+        if (btnType == BS_PUSHBUTTON || btnType == BS_DEFPUSHBUTTON) {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style | BS_FLAT);
+        }
+    }
+    return TRUE;
+}
+
 static void CreateMainControls(HWND hwnd) {
     g.hFontUI = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
@@ -1744,21 +1759,6 @@ static void CreateMainControls(HWND hwnd) {
     EnumChildWindows(hwnd, FlattenButtonsProc, 0);
 
     ShowTabPage(0);
-}
-
-// Duyệt toàn bộ control con, thêm style BS_FLAT cho mọi nút BUTTON để giao diện phẳng/hiện đại hơn.
-static BOOL CALLBACK FlattenButtonsProc(HWND hwnd, LPARAM) {
-    wchar_t cls[64];
-    GetClassNameW(hwnd, cls, 64);
-    if (lstrcmpiW(cls, L"Button") == 0) {
-        LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        // Chỉ thêm BS_FLAT cho pushbutton thường, không đụng tới checkbox (giữ khung ô vuông rõ ràng)
-        LONG_PTR btnType = style & 0xF; // BS_* nằm ở 4 bit thấp
-        if (btnType == BS_PUSHBUTTON || btnType == BS_DEFPUSHBUTTON) {
-            SetWindowLongPtrW(hwnd, GWL_STYLE, style | BS_FLAT);
-        }
-    }
-    return TRUE;
 }
 
 // ===================== Main window procedure =====================
