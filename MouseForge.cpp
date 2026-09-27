@@ -52,8 +52,16 @@ enum {
 
     IDC_PRESET_COMBO, IDC_PRESET_NAME, IDC_PRESET_SAVE, IDC_PRESET_LOAD, IDC_PRESET_DELETE, IDC_PRESET_REFRESH, IDC_PRESET_LIST,
 
+    IDC_MOUSE_SPEED, IDC_MOUSE_PRECISION, IDC_MOUSE_DBLCLICK, IDC_MOUSE_WHEEL, IDC_MOUSE_TRAILS,
+    IDC_MOUSE_APPLY, IDC_MOUSE_RESET, IDC_MOUSE_REFRESH,
+
     IDC_DLG_KEY_LBL, IDC_DLG_KEY, IDC_DLG_VAL_LBL, IDC_DLG_VAL, IDC_DLG_OK, IDC_DLG_CANCEL,
 };
+
+// Layout: chiều cao vùng header tiêu đề ở trên cùng, và vị trí Y của tab control bên dưới header.
+static const int kHeaderTop = 10;
+static const int kHeaderH = 34;
+static const int kTabTop = kHeaderTop + kHeaderH + 10; // = 54
 
 // ===================== Globals =====================
 struct AppGlobals {
@@ -84,7 +92,18 @@ struct AppGlobals {
     HWND presetCombo=nullptr, presetName=nullptr, presetSave=nullptr, presetLoad=nullptr, presetDelete=nullptr, presetRefresh=nullptr, presetList=nullptr;
     std::vector<fs::path> presetFiles;
 
-    static constexpr int TAB_COUNT = 6;
+    HWND hHeaderTitle=nullptr, hHeaderSub=nullptr;
+
+    HWND mouseSpeedTrack=nullptr, mouseSpeedVal=nullptr;
+    HWND mousePrecision=nullptr;
+    HWND mouseDblTrack=nullptr, mouseDblVal=nullptr;
+    HWND mouseWheelTrack=nullptr, mouseWheelVal=nullptr;
+    HWND mouseTrailsTrack=nullptr, mouseTrailsVal=nullptr;
+    HWND mouseApply=nullptr, mouseReset=nullptr, mouseRefresh=nullptr;
+
+    HFONT hFontTitle = nullptr;
+
+    static constexpr int TAB_COUNT = 7;
     std::vector<HWND> tabControls[TAB_COUNT];
 };
 static AppGlobals g;
@@ -1433,6 +1452,82 @@ static void OnPresetDelete() {
     RefreshPresetCombo();
 }
 
+// ===================== Mouse tab handlers (Windows thật, qua SystemParametersInfo) =====================
+static void UpdateMouseLabelsFromTrackbars() {
+    int speed = (int)SendMessageW(g.mouseSpeedTrack, TBM_GETPOS, 0, 0);
+    SetWindowTextW(g.mouseSpeedVal, std::to_wstring(speed).c_str());
+
+    int dbl = (int)SendMessageW(g.mouseDblTrack, TBM_GETPOS, 0, 0);
+    SetWindowTextW(g.mouseDblVal, std::to_wstring(dbl).c_str());
+
+    int wheel = (int)SendMessageW(g.mouseWheelTrack, TBM_GETPOS, 0, 0);
+    SetWindowTextW(g.mouseWheelVal, std::to_wstring(wheel).c_str());
+
+    int trails = (int)SendMessageW(g.mouseTrailsTrack, TBM_GETPOS, 0, 0);
+    SetWindowTextW(g.mouseTrailsVal, std::to_wstring(trails).c_str());
+}
+
+static void OnMouseRefresh() {
+    int speed = 10;
+    SystemParametersInfoW(SPI_GETMOUSESPEED, 0, &speed, 0);
+    SendMessageW(g.mouseSpeedTrack, TBM_SETPOS, TRUE, speed);
+
+    INT mouseParams[3] = { 6, 10, 1 };
+    SystemParametersInfoW(SPI_GETMOUSE, 0, mouseParams, 0);
+    SendMessageW(g.mousePrecision, BM_SETCHECK, mouseParams[2] != 0 ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    UINT dbl = GetDoubleClickTime();
+    if (dbl < 200) dbl = 200;
+    if (dbl > 900) dbl = 900;
+    SendMessageW(g.mouseDblTrack, TBM_SETPOS, TRUE, (LPARAM)dbl);
+
+    UINT wheelLines = 3;
+    SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &wheelLines, 0);
+    if (wheelLines > 20) wheelLines = 20;
+    SendMessageW(g.mouseWheelTrack, TBM_SETPOS, TRUE, (LPARAM)wheelLines);
+
+    UINT trails = 0;
+    SystemParametersInfoW(SPI_GETMOUSETRAILS, 0, &trails, 0);
+    if (trails > 10) trails = 10;
+    SendMessageW(g.mouseTrailsTrack, TBM_SETPOS, TRUE, (LPARAM)trails);
+
+    UpdateMouseLabelsFromTrackbars();
+    log_line(L"[Chuột] đã đọc cấu hình chuột hiện tại từ Windows");
+}
+
+static void OnMouseApply() {
+    int speed = (int)SendMessageW(g.mouseSpeedTrack, TBM_GETPOS, 0, 0);
+    SystemParametersInfoW(SPI_SETMOUSESPEED, 0, (PVOID)(INT_PTR)speed, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+
+    bool precision = SendMessageW(g.mousePrecision, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    INT mouseParams[3] = { precision ? 6 : 0, precision ? 10 : 0, precision ? 1 : 0 };
+    SystemParametersInfoW(SPI_SETMOUSE, 0, mouseParams, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+
+    UINT dbl = (UINT)SendMessageW(g.mouseDblTrack, TBM_GETPOS, 0, 0);
+    SetDoubleClickTime(dbl);
+
+    int wheel = (int)SendMessageW(g.mouseWheelTrack, TBM_GETPOS, 0, 0);
+    SystemParametersInfoW(SPI_SETWHEELSCROLLLINES, (UINT)wheel, nullptr, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+
+    int trails = (int)SendMessageW(g.mouseTrailsTrack, TBM_GETPOS, 0, 0);
+    SystemParametersInfoW(SPI_SETMOUSETRAILS, (UINT)trails, nullptr, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+
+    log_line(L"[Chuột] đã áp dụng cấu hình chuột vào Windows (speed=" + std::to_wstring(speed) +
+        L", precision=" + (precision ? L"on" : L"off") +
+        L", dblclick=" + std::to_wstring(dbl) + L"ms, wheel=" + std::to_wstring(wheel) +
+        L", trails=" + std::to_wstring(trails) + L")");
+}
+
+static void OnMouseReset() {
+    SendMessageW(g.mouseSpeedTrack, TBM_SETPOS, TRUE, 10);
+    SendMessageW(g.mousePrecision, BM_SETCHECK, BST_CHECKED, 0);
+    SendMessageW(g.mouseDblTrack, TBM_SETPOS, TRUE, 500);
+    SendMessageW(g.mouseWheelTrack, TBM_SETPOS, TRUE, 3);
+    SendMessageW(g.mouseTrailsTrack, TBM_SETPOS, TRUE, 0);
+    UpdateMouseLabelsFromTrackbars();
+    log_line(L"[Chuột] đã nạp giá trị mặc định của Windows (chưa áp dụng, bấm \"Áp dụng vào Windows\" để lưu thật)");
+}
+
 // ===================== Tab switching =====================
 static void ShowTabPage(int idx) {
     g.curTab = idx;
@@ -1451,11 +1546,23 @@ static void CreateMainControls(HWND hwnd) {
     g.hFontMono = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_MODERN, L"Consolas");
 
+    // ---- Header (tên app trên cùng) ----
+    g.hFontTitle = CreateFontW(-22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    g.hHeaderTitle = CreateWindowExW(0, L"STATIC", L"Mouse Forge", WS_CHILD | WS_VISIBLE | SS_LEFT,
+        10, kHeaderTop, 400, kHeaderH, hwnd, nullptr, g.hInst, nullptr);
+    SendMessageW(g.hHeaderTitle, WM_SETFONT, (WPARAM)g.hFontTitle, TRUE);
+    g.hHeaderSub = CreateWindowExW(0, L"STATIC", L"BlueStacks Tuning Panel  •  v2", WS_CHILD | WS_VISIBLE | SS_RIGHT,
+        480, kHeaderTop + 12, 390, 20, hwnd, nullptr, g.hInst, nullptr);
+    SendMessageW(g.hHeaderSub, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
+    CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+        10, kHeaderTop + kHeaderH + 2, 860, 2, hwnd, nullptr, g.hInst, nullptr);
+
     g.hTab = CreateWindowExW(0, WC_TABCONTROLW, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-        10, 10, 860, 500, hwnd, (HMENU)(INT_PTR)IDC_TAB, g.hInst, nullptr);
+        10, kTabTop, 860, 500, hwnd, (HMENU)(INT_PTR)IDC_TAB, g.hInst, nullptr);
     SendMessageW(g.hTab, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
 
-    const wchar_t* tabNames[AppGlobals::TAB_COUNT] = { L"Config", L"ADB", L"Tối ưu", L"Root", L"Thông tin", L"Presets" };
+    const wchar_t* tabNames[AppGlobals::TAB_COUNT] = { L"Config", L"ADB", L"Tối ưu", L"Root", L"Thông tin", L"Presets", L"Chuột" };
     for (int i = 0; i < AppGlobals::TAB_COUNT; ++i) {
         TCITEMW tie{};
         tie.mask = TCIF_TEXT;
@@ -1463,7 +1570,7 @@ static void CreateMainControls(HWND hwnd) {
         TabCtrl_InsertItem(g.hTab, i, &tie);
     }
 
-    int px = 20, py = 40;
+    int px = 20, py = kTabTop + 30;
 
     // ---- Tab 1: Config ----
     HWND cfgLbl1 = CreateWindowExW(0, L"STATIC", L"File config:", WS_CHILD, px, py, 100, 20, hwnd, nullptr, g.hInst, nullptr);
@@ -1576,6 +1683,53 @@ static void CreateMainControls(HWND hwnd) {
     for (HWND h : g.tabControls[5]) SendMessageW(h, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
     SendMessageW(g.presetList, WM_SETFONT, (WPARAM)g.hFontMono, TRUE);
 
+    // ---- Tab 7: Chuột (cấu hình chuột thật của Windows qua SystemParametersInfo) ----
+    HWND mLbl1 = CreateWindowExW(0, L"STATIC", L"Tốc độ con trỏ (1–20):", WS_CHILD, px, py, 220, 20, hwnd, nullptr, g.hInst, nullptr);
+    g.mouseSpeedTrack = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | TBS_AUTOTICKS | TBS_HORZ,
+        px + 230, py - 4, 380, 30, hwnd, (HMENU)(INT_PTR)IDC_MOUSE_SPEED, g.hInst, nullptr);
+    SendMessageW(g.mouseSpeedTrack, TBM_SETRANGE, TRUE, MAKELPARAM(1, 20));
+    g.mouseSpeedVal = CreateWindowExW(0, L"STATIC", L"10", WS_CHILD, px + 620, py, 40, 20, hwnd, nullptr, g.hInst, nullptr);
+
+    HWND mLbl2 = CreateWindowExW(0, L"STATIC", L"Độ nhạy double-click (200–900ms):", WS_CHILD, px, py + 40, 220, 20, hwnd, nullptr, g.hInst, nullptr);
+    g.mouseDblTrack = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | TBS_AUTOTICKS | TBS_HORZ,
+        px + 230, py + 36, 380, 30, hwnd, (HMENU)(INT_PTR)IDC_MOUSE_DBLCLICK, g.hInst, nullptr);
+    SendMessageW(g.mouseDblTrack, TBM_SETRANGE, TRUE, MAKELPARAM(200, 900));
+    SendMessageW(g.mouseDblTrack, TBM_SETLINESIZE, 0, 10);
+    g.mouseDblVal = CreateWindowExW(0, L"STATIC", L"500", WS_CHILD, px + 620, py + 40, 60, 20, hwnd, nullptr, g.hInst, nullptr);
+
+    HWND mLbl3 = CreateWindowExW(0, L"STATIC", L"Số dòng cuộn chuột (1–20):", WS_CHILD, px, py + 80, 220, 20, hwnd, nullptr, g.hInst, nullptr);
+    g.mouseWheelTrack = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | TBS_AUTOTICKS | TBS_HORZ,
+        px + 230, py + 76, 380, 30, hwnd, (HMENU)(INT_PTR)IDC_MOUSE_WHEEL, g.hInst, nullptr);
+    SendMessageW(g.mouseWheelTrack, TBM_SETRANGE, TRUE, MAKELPARAM(1, 20));
+    g.mouseWheelVal = CreateWindowExW(0, L"STATIC", L"3", WS_CHILD, px + 620, py + 80, 40, 20, hwnd, nullptr, g.hInst, nullptr);
+
+    HWND mLbl4 = CreateWindowExW(0, L"STATIC", L"Vệt chuột / mouse trails (0=tắt, 2–10):", WS_CHILD, px, py + 120, 220, 20, hwnd, nullptr, g.hInst, nullptr);
+    g.mouseTrailsTrack = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | TBS_AUTOTICKS | TBS_HORZ,
+        px + 230, py + 116, 380, 30, hwnd, (HMENU)(INT_PTR)IDC_MOUSE_TRAILS, g.hInst, nullptr);
+    SendMessageW(g.mouseTrailsTrack, TBM_SETRANGE, TRUE, MAKELPARAM(0, 10));
+    g.mouseTrailsVal = CreateWindowExW(0, L"STATIC", L"0", WS_CHILD, px + 620, py + 120, 40, 20, hwnd, nullptr, g.hInst, nullptr);
+
+    g.mousePrecision = CreateWindowExW(0, L"BUTTON", L"Enhance pointer precision (chống trôi tay khi ngắm chậm)",
+        WS_CHILD | BS_AUTOCHECKBOX, px, py + 160, 520, 22, hwnd, (HMENU)(INT_PTR)IDC_MOUSE_PRECISION, g.hInst, nullptr);
+    SendMessageW(g.mousePrecision, BM_SETCHECK, BST_CHECKED, 0);
+
+    g.mouseRefresh = CreateWindowExW(0, L"BUTTON", L"Đọc giá trị Windows hiện tại", WS_CHILD,
+        px, py + 200, 220, 30, hwnd, (HMENU)(INT_PTR)IDC_MOUSE_REFRESH, g.hInst, nullptr);
+    g.mouseApply = CreateWindowExW(0, L"BUTTON", L"Áp dụng vào Windows", WS_CHILD,
+        px + 230, py + 200, 220, 30, hwnd, (HMENU)(INT_PTR)IDC_MOUSE_APPLY, g.hInst, nullptr);
+    g.mouseReset = CreateWindowExW(0, L"BUTTON", L"Khôi phục mặc định Windows", WS_CHILD,
+        px + 460, py + 200, 220, 30, hwnd, (HMENU)(INT_PTR)IDC_MOUSE_RESET, g.hInst, nullptr);
+
+    HWND mNote = CreateWindowExW(0, L"STATIC",
+        L"Các giá trị này áp dụng cho con chuột thật trên toàn Windows (giống Control Panel > Mouse), "
+        L"không đọc/ghi bộ nhớ tiến trình game và không liên quan tới aim-assist trong game.",
+        WS_CHILD | SS_LEFT, px, py + 244, 800, 40, hwnd, nullptr, g.hInst, nullptr);
+
+    g.tabControls[6] = { mLbl1, g.mouseSpeedTrack, g.mouseSpeedVal, mLbl2, g.mouseDblTrack, g.mouseDblVal,
+                          mLbl3, g.mouseWheelTrack, g.mouseWheelVal, mLbl4, g.mouseTrailsTrack, g.mouseTrailsVal,
+                          g.mousePrecision, g.mouseRefresh, g.mouseApply, g.mouseReset, mNote };
+    for (HWND h : g.tabControls[6]) SendMessageW(h, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
+
     // ---- Log box ----
     g.hLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
@@ -1587,7 +1741,24 @@ static void CreateMainControls(HWND hwnd) {
         0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_STATUS, g.hInst, nullptr);
     SendMessageW(g.hStatus, SB_SETTEXT, 0, (LPARAM)L"Sẵn sàng");
 
+    EnumChildWindows(hwnd, FlattenButtonsProc, 0);
+
     ShowTabPage(0);
+}
+
+// Duyệt toàn bộ control con, thêm style BS_FLAT cho mọi nút BUTTON để giao diện phẳng/hiện đại hơn.
+static BOOL CALLBACK FlattenButtonsProc(HWND hwnd, LPARAM) {
+    wchar_t cls[64];
+    GetClassNameW(hwnd, cls, 64);
+    if (lstrcmpiW(cls, L"Button") == 0) {
+        LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        // Chỉ thêm BS_FLAT cho pushbutton thường, không đụng tới checkbox (giữ khung ô vuông rõ ràng)
+        LONG_PTR btnType = style & 0xF; // BS_* nằm ở 4 bit thấp
+        if (btnType == BS_PUSHBUTTON || btnType == BS_DEFPUSHBUTTON) {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style | BS_FLAT);
+        }
+    }
+    return TRUE;
 }
 
 // ===================== Main window procedure =====================
@@ -1606,6 +1777,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         RefreshAdbCombo();
         FillConfigList();
         RefreshPresetCombo();
+        OnMouseRefresh();
         log_line(L"[App] Mouse Forge đã khởi động");
         if (!g.admin) {
             log_line(L"[App] cảnh báo: chưa chạy với quyền Administrator, ghi config/priority sẽ bị chặn");
@@ -1628,9 +1800,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
             if (g.hLog) MoveWindow(g.hLog, 10, logTop, logWidth, logHeight, TRUE);
 
-            int tabHeight = logTop - 20;
+            int tabHeight = logTop - kTabTop - 10;
             int tabWidth = client.right - 20;
-            if (g.hTab) MoveWindow(g.hTab, 10, 10, tabWidth, tabHeight, TRUE);
+            if (g.hTab) MoveWindow(g.hTab, 10, kTabTop, tabWidth, tabHeight, TRUE);
         }
         break;
     }
@@ -1665,7 +1837,32 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             case IDC_PRESET_DELETE:  OnPresetDelete(); break;
             case IDC_PRESET_REFRESH: RefreshPresetCombo(); break;
             case IDC_PRESET_COMBO:   if (code == CBN_SELCHANGE) FillPresetList(); break;
+            case IDC_MOUSE_APPLY:    OnMouseApply(); break;
+            case IDC_MOUSE_RESET:    OnMouseReset(); break;
+            case IDC_MOUSE_REFRESH:  OnMouseRefresh(); break;
             default: break;
+        }
+        break;
+    }
+    case WM_HSCROLL: {
+        HWND ctl = (HWND)lParam;
+        if (ctl == g.mouseSpeedTrack || ctl == g.mouseDblTrack || ctl == g.mouseWheelTrack || ctl == g.mouseTrailsTrack) {
+            UpdateMouseLabelsFromTrackbars();
+        }
+        break;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wParam;
+        HWND ctl = (HWND)lParam;
+        if (ctl == g.hHeaderTitle) {
+            SetTextColor(hdc, RGB(20, 60, 120));
+            SetBkMode(hdc, TRANSPARENT);
+            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        }
+        if (ctl == g.hHeaderSub) {
+            SetTextColor(hdc, RGB(110, 110, 110));
+            SetBkMode(hdc, TRANSPARENT);
+            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
         }
         break;
     }
@@ -1711,7 +1908,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
     DWORD style = (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
 
-    RECT r{ 0, 0, 880, 760 };
+    RECT r{ 0, 0, 880, 760 + kTabTop - 10 };
     AdjustWindowRect(&r, style, FALSE);
 
     HWND hwnd = CreateWindowExW(0, L"MouseForgeMainWnd", L"Mouse Forge", style,
@@ -1731,6 +1928,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
     if (g.hFontUI) DeleteObject(g.hFontUI);
     if (g.hFontMono) DeleteObject(g.hFontMono);
+    if (g.hFontTitle) DeleteObject(g.hFontTitle);
 
     return (int)msg.wParam;
 }
