@@ -46,8 +46,11 @@ enum {
     IDC_CFG_COMBO, IDC_CFG_RESCAN, IDC_CFG_EDITKEY, IDC_CFG_BACKUP, IDC_CFG_RESTORE, IDC_CFG_LIST,
     IDC_ADB_COMBO, IDC_ADB_SERIAL_LBL, IDC_ADB_SERIAL, IDC_ADB_CONNECT, IDC_ADB_INFOLIST, IDC_ADB_KEYLIST,
     IDC_OPT_ANIM, IDC_OPT_HWUI, IDC_OPT_AWAKE, IDC_OPT_FINISH, IDC_OPT_GOV, IDC_OPT_SCHED, IDC_OPT_SCAN, IDC_OPT_LIST,
+    IDC_OPT_HAPTIC, IDC_OPT_TIMEOUT, IDC_OPT_ROTATION,
     IDC_ROOT_CHECK, IDC_ROOT_ON, IDC_ROOT_OFF, IDC_ROOT_VERIFY, IDC_ROOT_LIST,
     IDC_INFO_LOAD, IDC_INFO_PRIORITY, IDC_INFO_CLEARLOG, IDC_INFO_TEXT,
+
+    IDC_PRESET_COMBO, IDC_PRESET_NAME, IDC_PRESET_SAVE, IDC_PRESET_LOAD, IDC_PRESET_DELETE, IDC_PRESET_REFRESH, IDC_PRESET_LIST,
 
     IDC_DLG_KEY_LBL, IDC_DLG_KEY, IDC_DLG_VAL_LBL, IDC_DLG_VAL, IDC_DLG_OK, IDC_DLG_CANCEL,
 };
@@ -72,12 +75,17 @@ struct AppGlobals {
     std::vector<fs::path> adbBins;
 
     HWND optAnim=nullptr, optHwui=nullptr, optAwake=nullptr, optFinish=nullptr, optGov=nullptr, optSched=nullptr, optScan=nullptr, optList=nullptr;
+    HWND optHaptic=nullptr, optTimeout=nullptr, optRotation=nullptr;
 
     HWND rootCheck=nullptr, rootOn=nullptr, rootOff=nullptr, rootVerify=nullptr, rootList=nullptr;
 
     HWND infoLoad=nullptr, infoPriority=nullptr, infoClearLog=nullptr, infoText=nullptr;
 
-    std::vector<HWND> tabControls[5];
+    HWND presetCombo=nullptr, presetName=nullptr, presetSave=nullptr, presetLoad=nullptr, presetDelete=nullptr, presetRefresh=nullptr, presetList=nullptr;
+    std::vector<fs::path> presetFiles;
+
+    static constexpr int TAB_COUNT = 6;
+    std::vector<HWND> tabControls[TAB_COUNT];
 };
 static AppGlobals g;
 
@@ -580,6 +588,13 @@ static const std::vector<std::pair<std::wstring, std::wstring>> SAFE_GLOBAL_KEYS
     {L"stay_on_while_plugged_in", L"global"},
     {L"always_finish_activities", L"global"},
     {L"debug.hwui.profile", L"global"},
+    // --- v2: thêm các key AOSP có thật, đã xác minh trong AOSP Settings provider ---
+    {L"haptic_feedback_enabled", L"system"},
+    {L"screen_off_timeout", L"system"},
+    {L"accelerometer_rotation", L"system"},
+    {L"development_settings_enabled", L"global"},
+    {L"wifi_sleep_policy", L"global"},
+    {L"auto_time", L"global"},
 };
 
 static const std::vector<std::tuple<std::wstring, std::wstring, std::wstring>> USELESS_KEYS = {
@@ -1003,6 +1018,9 @@ static void OnOptScan() {
     bool doFinish = SendMessageW(g.optFinish, BM_GETCHECK, 0, 0) == BST_CHECKED;
     bool doGov = SendMessageW(g.optGov, BM_GETCHECK, 0, 0) == BST_CHECKED;
     bool doSched = SendMessageW(g.optSched, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    bool doHaptic = SendMessageW(g.optHaptic, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    bool doTimeout = SendMessageW(g.optTimeout, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    bool doRotation = SendMessageW(g.optRotation, BM_GETCHECK, 0, 0) == BST_CHECKED;
 
     int okCount = 0, failCount = 0, skipCount = 0;
 
@@ -1027,6 +1045,21 @@ static void OnOptScan() {
         bool ok = adb.put_global(L"always_finish_activities", L"0");
         if (ok) { addL(L"OK always_finish_activities = 0"); okCount++; }
         else { addL(L"FAIL always_finish_activities"); failCount++; }
+    }
+    if (doHaptic) {
+        bool ok = adb.put_system(L"haptic_feedback_enabled", L"0");
+        if (ok) { addL(L"OK haptic_feedback_enabled = 0"); okCount++; }
+        else { addL(L"FAIL haptic_feedback_enabled"); failCount++; }
+    }
+    if (doTimeout) {
+        bool ok = adb.put_system(L"screen_off_timeout", L"2147483647");
+        if (ok) { addL(L"OK screen_off_timeout = 2147483647 (không tự tắt màn hình)"); okCount++; }
+        else { addL(L"FAIL screen_off_timeout"); failCount++; }
+    }
+    if (doRotation) {
+        bool ok = adb.put_system(L"accelerometer_rotation", L"0");
+        if (ok) { addL(L"OK accelerometer_rotation = 0 (khoá xoay tự động)"); okCount++; }
+        else { addL(L"FAIL accelerometer_rotation"); failCount++; }
     }
 
     if (doGov) {
@@ -1231,10 +1264,179 @@ static void OnInfoClearLog() {
     SetWindowTextW(g.hLog, L"");
 }
 
+// ===================== Preset tab handlers =====================
+static fs::path presets_dir() {
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    fs::path exeDir = fs::path(exePath).parent_path();
+    fs::path dir = exeDir / L"presets";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    return dir;
+}
+
+struct OptCheckState {
+    bool anim, hwui, awake, finish, gov, sched, haptic, timeout, rotation;
+};
+
+static OptCheckState read_opt_checks() {
+    OptCheckState s{};
+    s.anim     = SendMessageW(g.optAnim, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    s.hwui     = SendMessageW(g.optHwui, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    s.awake    = SendMessageW(g.optAwake, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    s.finish   = SendMessageW(g.optFinish, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    s.gov      = SendMessageW(g.optGov, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    s.sched    = SendMessageW(g.optSched, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    s.haptic   = SendMessageW(g.optHaptic, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    s.timeout  = SendMessageW(g.optTimeout, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    s.rotation = SendMessageW(g.optRotation, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    return s;
+}
+
+static void apply_opt_checks(const OptCheckState& s) {
+    SendMessageW(g.optAnim, BM_SETCHECK, s.anim ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g.optHwui, BM_SETCHECK, s.hwui ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g.optAwake, BM_SETCHECK, s.awake ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g.optFinish, BM_SETCHECK, s.finish ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g.optGov, BM_SETCHECK, s.gov ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g.optSched, BM_SETCHECK, s.sched ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g.optHaptic, BM_SETCHECK, s.haptic ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g.optTimeout, BM_SETCHECK, s.timeout ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g.optRotation, BM_SETCHECK, s.rotation ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
+static void RefreshPresetCombo() {
+    g.presetFiles.clear();
+    fs::path dir = presets_dir();
+    std::error_code ec;
+    for (auto& entry : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (entry.is_regular_file() && entry.path().extension() == L".txt") {
+            g.presetFiles.push_back(entry.path());
+        }
+    }
+    SendMessageW(g.presetCombo, CB_RESETCONTENT, 0, 0);
+    for (auto& p : g.presetFiles) {
+        SendMessageW(g.presetCombo, CB_ADDSTRING, 0, (LPARAM)p.stem().wstring().c_str());
+    }
+    if (!g.presetFiles.empty()) SendMessageW(g.presetCombo, CB_SETCURSEL, 0, 0);
+    SendMessageW(g.presetList, LB_RESETCONTENT, 0, 0);
+}
+
+static void FillPresetList() {
+    int idx = (int)SendMessageW(g.presetCombo, CB_GETCURSEL, 0, 0);
+    SendMessageW(g.presetList, LB_RESETCONTENT, 0, 0);
+    if (idx == CB_ERR || idx < 0 || (size_t)idx >= g.presetFiles.size()) return;
+    std::ifstream f(g.presetFiles[idx], std::ios::binary);
+    if (!f.is_open()) return;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    std::wstring content = to_w(ss.str());
+    std::wstringstream wss(content);
+    std::wstring line;
+    while (std::getline(wss, line)) {
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        if (!line.empty()) SendMessageW(g.presetList, LB_ADDSTRING, 0, (LPARAM)line.c_str());
+    }
+}
+
+static void OnPresetSave() {
+    wchar_t nameBuf[256];
+    GetWindowTextW(g.presetName, nameBuf, 256);
+    std::wstring name = trim(nameBuf);
+    if (name.empty()) {
+        MessageBoxW(g.hMain, L"Nhập tên preset trước khi lưu.", L"Lỗi", MB_OK | MB_ICONERROR);
+        return;
+    }
+    name = safe_name(name);
+
+    OptCheckState s = read_opt_checks();
+    std::wstringstream out;
+    out << L"anim=" << (s.anim ? 1 : 0) << L"\n";
+    out << L"hwui=" << (s.hwui ? 1 : 0) << L"\n";
+    out << L"awake=" << (s.awake ? 1 : 0) << L"\n";
+    out << L"finish=" << (s.finish ? 1 : 0) << L"\n";
+    out << L"gov=" << (s.gov ? 1 : 0) << L"\n";
+    out << L"sched=" << (s.sched ? 1 : 0) << L"\n";
+    out << L"haptic=" << (s.haptic ? 1 : 0) << L"\n";
+    out << L"timeout=" << (s.timeout ? 1 : 0) << L"\n";
+    out << L"rotation=" << (s.rotation ? 1 : 0) << L"\n";
+
+    fs::path dest = presets_dir() / (name + L".txt");
+    std::string utf8 = to_a(out.str());
+    std::ofstream of(dest, std::ios::binary | std::ios::trunc);
+    if (!of.is_open()) {
+        log_line(L"[Preset] không ghi được file " + dest.wstring());
+        return;
+    }
+    of.write(utf8.data(), (std::streamsize)utf8.size());
+    of.close();
+
+    log_line(L"[Preset] đã lưu preset \"" + name + L"\"");
+    RefreshPresetCombo();
+}
+
+static void OnPresetLoad() {
+    int idx = (int)SendMessageW(g.presetCombo, CB_GETCURSEL, 0, 0);
+    if (idx == CB_ERR || idx < 0 || (size_t)idx >= g.presetFiles.size()) {
+        log_line(L"[Preset] chưa chọn preset");
+        return;
+    }
+    std::ifstream f(g.presetFiles[idx], std::ios::binary);
+    if (!f.is_open()) { log_line(L"[Preset] không đọc được file preset"); return; }
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    std::wstring content = to_w(ss.str());
+
+    std::map<std::wstring, bool> kv;
+    std::wstringstream wss(content);
+    std::wstring line;
+    while (std::getline(wss, line)) {
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        size_t eq = line.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        std::wstring k = line.substr(0, eq);
+        std::wstring v = line.substr(eq + 1);
+        kv[k] = (v == L"1");
+    }
+
+    OptCheckState s = read_opt_checks();
+    if (kv.count(L"anim")) s.anim = kv[L"anim"];
+    if (kv.count(L"hwui")) s.hwui = kv[L"hwui"];
+    if (kv.count(L"awake")) s.awake = kv[L"awake"];
+    if (kv.count(L"finish")) s.finish = kv[L"finish"];
+    if (kv.count(L"gov")) s.gov = kv[L"gov"];
+    if (kv.count(L"sched")) s.sched = kv[L"sched"];
+    if (kv.count(L"haptic")) s.haptic = kv[L"haptic"];
+    if (kv.count(L"timeout")) s.timeout = kv[L"timeout"];
+    if (kv.count(L"rotation")) s.rotation = kv[L"rotation"];
+    apply_opt_checks(s);
+
+    log_line(L"[Preset] đã nạp preset \"" + g.presetFiles[idx].stem().wstring() + L"\" vào tab Tối ưu. Sang tab Tối ưu và bấm \"Quét prop + tối ưu\" để áp dụng.");
+    FillPresetList();
+}
+
+static void OnPresetDelete() {
+    int idx = (int)SendMessageW(g.presetCombo, CB_GETCURSEL, 0, 0);
+    if (idx == CB_ERR || idx < 0 || (size_t)idx >= g.presetFiles.size()) {
+        log_line(L"[Preset] chưa chọn preset");
+        return;
+    }
+    std::wstring name = g.presetFiles[idx].stem().wstring();
+    int r = MessageBoxW(g.hMain, (L"Xoá preset \"" + name + L"\"?").c_str(), L"Xác nhận", MB_YESNO | MB_ICONWARNING);
+    if (r != IDYES) return;
+
+    std::error_code ec;
+    fs::remove(g.presetFiles[idx], ec);
+    if (ec) log_line(L"[Preset] xoá thất bại: " + name);
+    else log_line(L"[Preset] đã xoá preset \"" + name + L"\"");
+    RefreshPresetCombo();
+}
+
 // ===================== Tab switching =====================
 static void ShowTabPage(int idx) {
     g.curTab = idx;
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < AppGlobals::TAB_COUNT; ++i) {
         int cmd = (i == idx) ? SW_SHOW : SW_HIDE;
         for (HWND h : g.tabControls[i]) {
             if (h) ShowWindow(h, cmd);
@@ -1253,8 +1455,8 @@ static void CreateMainControls(HWND hwnd) {
         10, 10, 860, 500, hwnd, (HMENU)(INT_PTR)IDC_TAB, g.hInst, nullptr);
     SendMessageW(g.hTab, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
 
-    const wchar_t* tabNames[5] = { L"Config", L"ADB", L"Tối ưu", L"Root", L"Thông tin" };
-    for (int i = 0; i < 5; ++i) {
+    const wchar_t* tabNames[AppGlobals::TAB_COUNT] = { L"Config", L"ADB", L"Tối ưu", L"Root", L"Thông tin", L"Presets" };
+    for (int i = 0; i < AppGlobals::TAB_COUNT; ++i) {
         TCITEMW tie{};
         tie.mask = TCIF_TEXT;
         tie.pszText = (LPWSTR)tabNames[i];
@@ -1312,15 +1514,18 @@ static void CreateMainControls(HWND hwnd) {
     g.optFinish = CreateWindowExW(0, L"BUTTON", L"always finish off", WS_CHILD | BS_AUTOCHECKBOX, px, oy + 84, 220, 22, hwnd, (HMENU)(INT_PTR)IDC_OPT_FINISH, g.hInst, nullptr);
     g.optGov = CreateWindowExW(0, L"BUTTON", L"governor CPU (cần root)", WS_CHILD | BS_AUTOCHECKBOX, px + 280, oy, 280, 22, hwnd, (HMENU)(INT_PTR)IDC_OPT_GOV, g.hInst, nullptr);
     g.optSched = CreateWindowExW(0, L"BUTTON", L"scheduler (cần root)", WS_CHILD | BS_AUTOCHECKBOX, px + 280, oy + 28, 280, 22, hwnd, (HMENU)(INT_PTR)IDC_OPT_SCHED, g.hInst, nullptr);
-    g.optScan = CreateWindowExW(0, L"BUTTON", L"Quét prop + tối ưu", WS_CHILD, px, oy + 120, 220, 30, hwnd, (HMENU)(INT_PTR)IDC_OPT_SCAN, g.hInst, nullptr);
+    g.optHaptic = CreateWindowExW(0, L"BUTTON", L"tắt haptic feedback", WS_CHILD | BS_AUTOCHECKBOX, px + 280, oy + 56, 280, 22, hwnd, (HMENU)(INT_PTR)IDC_OPT_HAPTIC, g.hInst, nullptr);
+    g.optTimeout = CreateWindowExW(0, L"BUTTON", L"không tự tắt màn hình", WS_CHILD | BS_AUTOCHECKBOX, px + 280, oy + 84, 280, 22, hwnd, (HMENU)(INT_PTR)IDC_OPT_TIMEOUT, g.hInst, nullptr);
+    g.optRotation = CreateWindowExW(0, L"BUTTON", L"khoá xoay màn hình tự động", WS_CHILD | BS_AUTOCHECKBOX, px + 280, oy + 112, 280, 22, hwnd, (HMENU)(INT_PTR)IDC_OPT_ROTATION, g.hInst, nullptr);
+    g.optScan = CreateWindowExW(0, L"BUTTON", L"Quét prop + tối ưu", WS_CHILD, px, oy + 150, 220, 30, hwnd, (HMENU)(INT_PTR)IDC_OPT_SCAN, g.hInst, nullptr);
     g.optList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
         WS_CHILD | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY | LBS_DISABLENOSCROLL,
-        px, oy + 160, 800, 280, hwnd, (HMENU)(INT_PTR)IDC_OPT_LIST, g.hInst, nullptr);
+        px, oy + 190, 800, 250, hwnd, (HMENU)(INT_PTR)IDC_OPT_LIST, g.hInst, nullptr);
 
-    for (HWND h : { g.optAnim, g.optHwui, g.optAwake, g.optFinish, g.optGov, g.optSched }) {
+    for (HWND h : { g.optAnim, g.optHwui, g.optAwake, g.optFinish, g.optGov, g.optSched, g.optHaptic, g.optTimeout, g.optRotation }) {
         SendMessageW(h, BM_SETCHECK, BST_CHECKED, 0);
     }
-    g.tabControls[2] = { g.optAnim, g.optHwui, g.optAwake, g.optFinish, g.optGov, g.optSched, g.optScan, g.optList };
+    g.tabControls[2] = { g.optAnim, g.optHwui, g.optAwake, g.optFinish, g.optGov, g.optSched, g.optHaptic, g.optTimeout, g.optRotation, g.optScan, g.optList };
     for (HWND h : g.tabControls[2]) SendMessageW(h, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
     SendMessageW(g.optList, WM_SETFONT, (WPARAM)g.hFontMono, TRUE);
 
@@ -1347,6 +1552,29 @@ static void CreateMainControls(HWND hwnd) {
 
     g.tabControls[4] = { g.infoLoad, g.infoPriority, g.infoClearLog, g.infoText };
     for (HWND h : g.tabControls[4]) SendMessageW(h, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
+
+    // ---- Tab 6: Presets ----
+    HWND presetLbl1 = CreateWindowExW(0, L"STATIC", L"Preset đã lưu:", WS_CHILD, px, py, 110, 20, hwnd, nullptr, g.hInst, nullptr);
+    g.presetCombo = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+        px + 110, py - 2, 300, 200, hwnd, (HMENU)(INT_PTR)IDC_PRESET_COMBO, g.hInst, nullptr);
+    g.presetLoad = CreateWindowExW(0, L"BUTTON", L"Nạp", WS_CHILD, px + 420, py - 3, 90, 26, hwnd, (HMENU)(INT_PTR)IDC_PRESET_LOAD, g.hInst, nullptr);
+    g.presetDelete = CreateWindowExW(0, L"BUTTON", L"Xoá", WS_CHILD, px + 520, py - 3, 90, 26, hwnd, (HMENU)(INT_PTR)IDC_PRESET_DELETE, g.hInst, nullptr);
+    g.presetRefresh = CreateWindowExW(0, L"BUTTON", L"Quét lại", WS_CHILD, px + 620, py - 3, 90, 26, hwnd, (HMENU)(INT_PTR)IDC_PRESET_REFRESH, g.hInst, nullptr);
+
+    HWND presetLbl2 = CreateWindowExW(0, L"STATIC", L"Tên preset mới:", WS_CHILD, px, py + 40, 110, 20, hwnd, nullptr, g.hInst, nullptr);
+    g.presetName = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_BORDER,
+        px + 110, py + 38, 300, 24, hwnd, (HMENU)(INT_PTR)IDC_PRESET_NAME, g.hInst, nullptr);
+    g.presetSave = CreateWindowExW(0, L"BUTTON", L"Lưu lựa chọn hiện tại ở tab Tối ưu thành preset", WS_CHILD,
+        px + 420, py + 37, 380, 26, hwnd, (HMENU)(INT_PTR)IDC_PRESET_SAVE, g.hInst, nullptr);
+
+    g.presetList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+        WS_CHILD | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY | LBS_DISABLENOSCROLL,
+        px, py + 80, 800, 354, hwnd, (HMENU)(INT_PTR)IDC_PRESET_LIST, g.hInst, nullptr);
+
+    g.tabControls[5] = { presetLbl1, g.presetCombo, g.presetLoad, g.presetDelete, g.presetRefresh,
+                          presetLbl2, g.presetName, g.presetSave, g.presetList };
+    for (HWND h : g.tabControls[5]) SendMessageW(h, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
+    SendMessageW(g.presetList, WM_SETFONT, (WPARAM)g.hFontMono, TRUE);
 
     // ---- Log box ----
     g.hLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -1377,6 +1605,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         RefreshConfigCombo();
         RefreshAdbCombo();
         FillConfigList();
+        RefreshPresetCombo();
         log_line(L"[App] Mouse Forge đã khởi động");
         if (!g.admin) {
             log_line(L"[App] cảnh báo: chưa chạy với quyền Administrator, ghi config/priority sẽ bị chặn");
@@ -1431,6 +1660,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             case IDC_INFO_LOAD:    OnInfoLoad(); break;
             case IDC_INFO_PRIORITY:OnInfoPriority(); break;
             case IDC_INFO_CLEARLOG:OnInfoClearLog(); break;
+            case IDC_PRESET_SAVE:    OnPresetSave(); break;
+            case IDC_PRESET_LOAD:    OnPresetLoad(); break;
+            case IDC_PRESET_DELETE:  OnPresetDelete(); break;
+            case IDC_PRESET_REFRESH: RefreshPresetCombo(); break;
+            case IDC_PRESET_COMBO:   if (code == CBN_SELCHANGE) FillPresetList(); break;
             default: break;
         }
         break;
