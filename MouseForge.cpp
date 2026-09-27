@@ -35,6 +35,16 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "advapi32.lib")
 
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DWMWA_CAPTION_COLOR
+#define DWMWA_CAPTION_COLOR 35
+#endif
+#ifndef DWMWA_TEXT_COLOR
+#define DWMWA_TEXT_COLOR 36
+#endif
+
 namespace fs = std::filesystem;
 
 // ===================== IDs =====================
@@ -102,6 +112,9 @@ struct AppGlobals {
     HWND mouseApply=nullptr, mouseReset=nullptr, mouseRefresh=nullptr;
 
     HFONT hFontTitle = nullptr;
+    HWND hHeaderPanel = nullptr;
+    HBRUSH hBrushHeader = nullptr;
+    HBRUSH hBrushWindow = nullptr;
 
     static constexpr int TAB_COUNT = 7;
     std::vector<HWND> tabControls[TAB_COUNT];
@@ -1561,14 +1574,18 @@ static void CreateMainControls(HWND hwnd) {
     g.hFontMono = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_MODERN, L"Consolas");
 
-    // ---- Header (tên app trên cùng) ----
+    // ---- Header (banner màu + tên app trên cùng) ----
+    // Panel màu nền phải tạo TRƯỚC (z-order dưới) để chữ đè lên trên
+    g.hHeaderPanel = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+        0, 0, 900, kHeaderTop + kHeaderH + 8, hwnd, nullptr, g.hInst, nullptr);
+
     g.hFontTitle = CreateFontW(-22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
     g.hHeaderTitle = CreateWindowExW(0, L"STATIC", L"Mouse Forge", WS_CHILD | WS_VISIBLE | SS_LEFT,
-        10, kHeaderTop, 400, kHeaderH, hwnd, nullptr, g.hInst, nullptr);
+        16, kHeaderTop, 400, kHeaderH, hwnd, nullptr, g.hInst, nullptr);
     SendMessageW(g.hHeaderTitle, WM_SETFONT, (WPARAM)g.hFontTitle, TRUE);
     g.hHeaderSub = CreateWindowExW(0, L"STATIC", L"BlueStacks Tuning Panel  •  v2", WS_CHILD | WS_VISIBLE | SS_RIGHT,
-        480, kHeaderTop + 12, 390, 20, hwnd, nullptr, g.hInst, nullptr);
+        480, kHeaderTop + 12, 384, 20, hwnd, nullptr, g.hInst, nullptr);
     SendMessageW(g.hHeaderSub, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
     CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
         10, kHeaderTop + kHeaderH + 2, 860, 2, hwnd, nullptr, g.hInst, nullptr);
@@ -1854,17 +1871,22 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_CTLCOLORSTATIC: {
         HDC hdc = (HDC)wParam;
         HWND ctl = (HWND)lParam;
+        if (ctl == g.hHeaderPanel) {
+            return (LRESULT)g.hBrushHeader;
+        }
         if (ctl == g.hHeaderTitle) {
-            SetTextColor(hdc, RGB(20, 60, 120));
+            SetTextColor(hdc, RGB(15, 55, 115));
             SetBkMode(hdc, TRANSPARENT);
-            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+            return (LRESULT)g.hBrushHeader;
         }
         if (ctl == g.hHeaderSub) {
-            SetTextColor(hdc, RGB(110, 110, 110));
+            SetTextColor(hdc, RGB(80, 95, 120));
             SetBkMode(hdc, TRANSPARENT);
-            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+            return (LRESULT)g.hBrushHeader;
         }
-        break;
+        // Mọi STATIC khác (nhãn trong các tab): nền đồng bộ với màu cửa sổ, chữ trong suốt
+        SetBkMode(hdc, TRANSPARENT);
+        return (LRESULT)g.hBrushWindow;
     }
     case WM_CLOSE:
         DestroyWindow(hwnd);
@@ -1880,6 +1902,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     g.hInst = hInstance;
 
+    // Tạo brush màu trước khi đăng ký window class (cần cho wc.hbrBackground)
+    g.hBrushHeader = CreateSolidBrush(RGB(226, 236, 250));
+    g.hBrushWindow = CreateSolidBrush(RGB(244, 246, 249));
+
     INITCOMMONCONTROLSEX icc{};
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_TAB_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES;
@@ -1891,7 +1917,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     wc.lpfnWndProc = MainWndProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = g.hBrushWindow;
     wc.lpszClassName = L"MouseForgeMainWnd";
     wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(101));
     if (!RegisterClassExW(&wc)) return 0;
@@ -1902,7 +1928,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     wcDlg.lpfnWndProc = EditKeyDlgProc;
     wcDlg.hInstance = hInstance;
     wcDlg.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wcDlg.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wcDlg.hbrBackground = g.hBrushWindow;
     wcDlg.lpszClassName = L"MFEditKeyDlg";
     if (!RegisterClassExW(&wcDlg)) return 0;
 
@@ -1917,6 +1943,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
     if (!hwnd) return 0;
 
+    // Windows 11: tô màu caption bar đồng bộ với banner header của app (bỏ qua lỗi nếu chạy trên bản Windows cũ hơn)
+    COLORREF capColor = RGB(226, 236, 250);
+    COLORREF textColor = RGB(15, 55, 115);
+    DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &capColor, sizeof(capColor));
+    DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &textColor, sizeof(textColor));
+
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
@@ -1929,6 +1961,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     if (g.hFontUI) DeleteObject(g.hFontUI);
     if (g.hFontMono) DeleteObject(g.hFontMono);
     if (g.hFontTitle) DeleteObject(g.hFontTitle);
+    if (g.hBrushHeader) DeleteObject(g.hBrushHeader);
+    if (g.hBrushWindow) DeleteObject(g.hBrushWindow);
 
     return (int)msg.wParam;
 }
