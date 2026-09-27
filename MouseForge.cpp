@@ -26,6 +26,9 @@
 #include <algorithm>
 #include <filesystem>
 #include <cwctype>
+#include <cmath>
+#include <deque>
+#include <cstdlib>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "user32.lib")
@@ -65,6 +68,9 @@ enum {
     IDC_MOUSE_SPEED, IDC_MOUSE_PRECISION, IDC_MOUSE_DBLCLICK, IDC_MOUSE_WHEEL, IDC_MOUSE_TRAILS,
     IDC_MOUSE_APPLY, IDC_MOUSE_RESET, IDC_MOUSE_REFRESH,
 
+    IDC_ENG_ENABLE, IDC_ENG_EMA, IDC_ENG_VELWIN, IDC_ENG_MICROTH, IDC_ENG_ACCEL,
+    IDC_ENG_OFFSET, IDC_ENG_CAP, IDC_ENG_REFDPI, IDC_ENG_CURDPI, IDC_ENG_RESET,
+
     IDC_DLG_KEY_LBL, IDC_DLG_KEY, IDC_DLG_VAL_LBL, IDC_DLG_VAL, IDC_DLG_OK, IDC_DLG_CANCEL,
 };
 
@@ -72,6 +78,123 @@ enum {
 static const int kHeaderTop = 10;
 static const int kHeaderH = 34;
 static const int kTabTop = kHeaderTop + kHeaderH + 10; // = 54
+
+// ===================== Mouse Engine (EMA smoothing + custom acceleration curve) =====================
+// Hoạt động thuần ở tầng raw input <-> OS cursor, giống RawAccel: không đọc bộ nhớ/pixel của bất kỳ
+// tiến trình nào, không biết "target" ở đâu. Chỉ biến đổi delta chuột thô trước khi OS di chuyển con trỏ.
+struct MouseEngineState {
+    std::atomic<bool> enabled{false};
+    bool rawRegistered = false;
+
+    // Tham số (đơn vị thật; lưu double, UI dùng trackbar int đã nhân hệ số)
+    double emaFastMs   = 2.0;   // 0.0 - 10.0
+    int    velWindow    = 4;     // 1 - 10 mẫu
+    double microThresh  = 2.0;   // 0.0 - 10.0 px
+    double accel        = 0.04;  // 0.00 - 0.50
+    double accelOffset  = 5.0;   // 0.0 - 20.0
+    double accelCap     = 1.40;  // 1.00 - 3.00
+    double refDpi       = 800.0;
+    double curDpi       = 800.0;
+
+    // Trạng thái nội bộ của bộ lọc (không phơi ra UI)
+    double emaX = 0, emaY = 0;
+    double carryX = 0, carryY = 0;
+    ULONGLONG lastTick = 0;
+    std::deque<double> velHist;
+};
+static MouseEngineState g_engine;
+
+// Xử lý 1 sự kiện raw mouse delta: EMA smoothing (time-normalized) + đường cong gia tốc tùy chỉnh,
+// rồi bơm lại chuyển động đã xử lý vào OS bằng SendInput (relative move).
+static void MouseEngine_ProcessAndInject(LONG dx, LONG dy) {
+    if (dx == 0 && dy == 0) return;
+
+    ULONGLONG now = GetTickCount64();
+    double dt = g_engine.lastTick ? (double)(now - g_engine.lastTick) : 8.0;
+    if (dt <= 0.0) dt = 8.0;
+    if (dt > 100.0) dt = 100.0; // tránh nhảy số khi vừa bật lại sau khi đứng yên lâu
+    g_engine.lastTick = now;
+
+    double scale = (g_engine.curDpi > 0.0) ? (g_engine.refDpi / g_engine.curDpi) : 1.0;
+    double fx = (double)dx * scale;
+    double fy = (double)dy * scale;
+    double dist = std::sqrt(fx * fx + fy * fy);
+
+    // Micro-threshold: chuyển động cực nhỏ (rung tay) thì bỏ qua EMA/curve, đi thẳng 1:1 để không mất độ chính xác khi ngắm tĩnh
+    double outX, outY;
+    if (dist <= g_engine.microThresh) {
+        outX = fx; outY = fy;
+        g_engine.emaX = fx; g_engine.emaY = fy; // đồng bộ lại bộ lọc, tránh giật khi tăng tốc trở lại
+    } else {
+        // EMA time-normalized: alpha phụ thuộc dt để tốc độ khung hình không ảnh hưởng độ mượt
+        double alpha = 1.0 - std::exp(-dt / (g_engine.emaFastMs > 0.01 ? g_engine.emaFastMs : 0.01));
+        g_engine.emaX += alpha * (fx - g_engine.emaX);
+        g_engine.emaY += alpha * (fy - g_engine.emaY);
+        outX = g_engine.emaX; outY = g_engine.emaY;
+    }
+
+    // Velocity trung bình trượt (px/ms) để quyết định hệ số gia tốc
+    double vel = dist / dt;
+    g_engine.velHist.push_back(vel);
+    while ((int)g_engine.velHist.size() > std::max(1, g_engine.velWindow)) g_engine.velHist.pop_front();
+    double avgVel = 0;
+    for (double v : g_engine.velHist) avgVel += v;
+    avgVel /= (double)g_engine.velHist.size();
+
+    double mult = 1.0;
+    if (avgVel > g_engine.accelOffset) {
+        mult = 1.0 + g_engine.accel * (avgVel - g_engine.accelOffset);
+        if (mult > g_engine.accelCap) mult = g_engine.accelCap;
+    }
+    outX *= mult; outY *= mult;
+
+    // Giữ phần dư thập phân để không mất độ chính xác khi làm tròn xuống pixel nguyên
+    g_engine.carryX += outX;
+    g_engine.carryY += outY;
+    int moveX = (int)g_engine.carryX;
+    int moveY = (int)g_engine.carryY;
+    g_engine.carryX -= moveX;
+    g_engine.carryY -= moveY;
+
+    if (moveX != 0 || moveY != 0) {
+        INPUT input{};
+        input.type = INPUT_MOUSE;
+        input.mi.dx = moveX;
+        input.mi.dy = moveY;
+        input.mi.dwFlags = MOUSEEVENTF_MOVE;
+        SendInput(1, &input, sizeof(INPUT));
+    }
+}
+
+// Đăng ký raw input: RIDEV_INPUTSINK để nhận cả khi cửa sổ không active, RIDEV_NOLEGACY để OS
+// không tự áp accel/di chuyển con trỏ mặc định nữa — từ đây app tự chịu trách nhiệm di chuyển con trỏ.
+static bool MouseEngine_Register(HWND hwnd) {
+    RAWINPUTDEVICE rid{};
+    rid.usUsagePage = 0x01; // Generic Desktop
+    rid.usUsage = 0x02;     // Mouse
+    rid.dwFlags = RIDEV_INPUTSINK | RIDEV_NOLEGACY;
+    rid.hwndTarget = hwnd;
+    if (RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+        g_engine.rawRegistered = true;
+        g_engine.emaX = g_engine.emaY = 0;
+        g_engine.carryX = g_engine.carryY = 0;
+        g_engine.lastTick = 0;
+        g_engine.velHist.clear();
+        return true;
+    }
+    return false;
+}
+
+// Gỡ đăng ký raw input -> trả lại hành vi chuột mặc định của Windows ngay lập tức.
+static void MouseEngine_Unregister(HWND hwnd) {
+    RAWINPUTDEVICE rid{};
+    rid.usUsagePage = 0x01;
+    rid.usUsage = 0x02;
+    rid.dwFlags = RIDEV_REMOVE;
+    rid.hwndTarget = nullptr;
+    RegisterRawInputDevices(&rid, 1, sizeof(rid));
+    g_engine.rawRegistered = false;
+}
 
 // ===================== Globals =====================
 struct AppGlobals {
@@ -111,12 +234,23 @@ struct AppGlobals {
     HWND mouseTrailsTrack=nullptr, mouseTrailsVal=nullptr;
     HWND mouseApply=nullptr, mouseReset=nullptr, mouseRefresh=nullptr;
 
+    HWND engEnable=nullptr;
+    HWND engEmaTrack=nullptr, engEmaVal=nullptr;
+    HWND engVelTrack=nullptr, engVelVal=nullptr;
+    HWND engMicroTrack=nullptr, engMicroVal=nullptr;
+    HWND engAccelTrack=nullptr, engAccelVal=nullptr;
+    HWND engOffsetTrack=nullptr, engOffsetVal=nullptr;
+    HWND engCapTrack=nullptr, engCapVal=nullptr;
+    HWND engRefDpi=nullptr, engCurDpi=nullptr;
+    HWND engReset=nullptr;
+    HWND engStatus=nullptr;
+
     HFONT hFontTitle = nullptr;
     HWND hHeaderPanel = nullptr;
     HBRUSH hBrushHeader = nullptr;
     HBRUSH hBrushWindow = nullptr;
 
-    static constexpr int TAB_COUNT = 7;
+    static constexpr int TAB_COUNT = 8;
     std::vector<HWND> tabControls[TAB_COUNT];
 };
 static AppGlobals g;
@@ -1541,6 +1675,85 @@ static void OnMouseReset() {
     log_line(L"[Chuột] đã nạp giá trị mặc định của Windows (chưa áp dụng, bấm \"Áp dụng vào Windows\" để lưu thật)");
 }
 
+// ===================== Engine tab handlers =====================
+static std::wstring FormatFixed(double v, int decimals) {
+    double mul = std::pow(10.0, decimals);
+    long long scaled = (long long)std::llround(v * mul);
+    bool neg = scaled < 0;
+    if (neg) scaled = -scaled;
+    long long intPart = scaled / (long long)mul;
+    long long frac = scaled % (long long)mul;
+    std::wstring fracStr = std::to_wstring(frac);
+    while ((int)fracStr.size() < decimals) fracStr = L"0" + fracStr;
+    return (neg ? L"-" : L"") + std::to_wstring(intPart) + L"." + fracStr;
+}
+
+// Đọc toàn bộ control của tab Engine -> đổ vào g_engine (áp dụng NGAY, kể cả khi engine đang chạy)
+// và cập nhật nhãn số hiển thị cạnh mỗi thanh trượt.
+static void EngineSyncFromControls() {
+    double ema = (double)SendMessageW(g.engEmaTrack, TBM_GETPOS, 0, 0) / 10.0;
+    int velw = (int)SendMessageW(g.engVelTrack, TBM_GETPOS, 0, 0);
+    double micro = (double)SendMessageW(g.engMicroTrack, TBM_GETPOS, 0, 0) / 10.0;
+    double accel = (double)SendMessageW(g.engAccelTrack, TBM_GETPOS, 0, 0) / 100.0;
+    double offset = (double)SendMessageW(g.engOffsetTrack, TBM_GETPOS, 0, 0) / 10.0;
+    double cap = (double)SendMessageW(g.engCapTrack, TBM_GETPOS, 0, 0) / 100.0;
+
+    g_engine.emaFastMs = ema;
+    g_engine.velWindow = velw;
+    g_engine.microThresh = micro;
+    g_engine.accel = accel;
+    g_engine.accelOffset = offset;
+    g_engine.accelCap = cap;
+
+    SetWindowTextW(g.engEmaVal, FormatFixed(ema, 1).c_str());
+    SetWindowTextW(g.engVelVal, std::to_wstring(velw).c_str());
+    SetWindowTextW(g.engMicroVal, FormatFixed(micro, 1).c_str());
+    SetWindowTextW(g.engAccelVal, FormatFixed(accel, 2).c_str());
+    SetWindowTextW(g.engOffsetVal, FormatFixed(offset, 1).c_str());
+    SetWindowTextW(g.engCapVal, FormatFixed(cap, 2).c_str());
+
+    wchar_t dpiBuf[16];
+    GetWindowTextW(g.engRefDpi, dpiBuf, 16);
+    double refDpi = _wtof(dpiBuf);
+    if (refDpi >= 100.0 && refDpi <= 32000.0) g_engine.refDpi = refDpi;
+    GetWindowTextW(g.engCurDpi, dpiBuf, 16);
+    double curDpi = _wtof(dpiBuf);
+    if (curDpi >= 100.0 && curDpi <= 32000.0) g_engine.curDpi = curDpi;
+}
+
+static void OnEngToggle() {
+    bool wantOn = SendMessageW(g.engEnable, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (wantOn) {
+        EngineSyncFromControls();
+        if (MouseEngine_Register(g.hMain)) {
+            g_engine.enabled = true;
+            SetWindowTextW(g.engStatus, L"● BẬT");
+            log_line(L"[Engine] đã bật Mouse Engine (raw input, RIDEV_NOLEGACY)");
+        } else {
+            SendMessageW(g.engEnable, BM_SETCHECK, BST_UNCHECKED, 0);
+            log_line(L"[Engine] KHÔNG bật được (RegisterRawInputDevices thất bại)");
+        }
+    } else {
+        g_engine.enabled = false;
+        MouseEngine_Unregister(g.hMain);
+        SetWindowTextW(g.engStatus, L"● TẮT");
+        log_line(L"[Engine] đã tắt Mouse Engine, chuột trở lại mặc định Windows");
+    }
+}
+
+static void OnEngReset() {
+    SendMessageW(g.engEmaTrack, TBM_SETPOS, TRUE, 20);     // 2.0
+    SendMessageW(g.engVelTrack, TBM_SETPOS, TRUE, 4);
+    SendMessageW(g.engMicroTrack, TBM_SETPOS, TRUE, 20);   // 2.0
+    SendMessageW(g.engAccelTrack, TBM_SETPOS, TRUE, 4);    // 0.04
+    SendMessageW(g.engOffsetTrack, TBM_SETPOS, TRUE, 50);  // 5.0
+    SendMessageW(g.engCapTrack, TBM_SETPOS, TRUE, 140);    // 1.40
+    SetWindowTextW(g.engRefDpi, L"800");
+    SetWindowTextW(g.engCurDpi, L"800");
+    EngineSyncFromControls();
+    log_line(L"[Engine] đã khôi phục thông số mặc định (EMA=2.0, VelWin=4, Micro=2.0, Accel=0.04, Offset=5.0, Cap=1.40, DPI=800/800)");
+}
+
 // ===================== Tab switching =====================
 static void ShowTabPage(int idx) {
     g.curTab = idx;
@@ -1594,7 +1807,7 @@ static void CreateMainControls(HWND hwnd) {
         10, kTabTop, 860, 500, hwnd, (HMENU)(INT_PTR)IDC_TAB, g.hInst, nullptr);
     SendMessageW(g.hTab, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
 
-    const wchar_t* tabNames[AppGlobals::TAB_COUNT] = { L"Config", L"ADB", L"Tối ưu", L"Root", L"Thông tin", L"Presets", L"Chuột" };
+    const wchar_t* tabNames[AppGlobals::TAB_COUNT] = { L"Config", L"ADB", L"Tối ưu", L"Root", L"Thông tin", L"Presets", L"Chuột", L"Engine" };
     for (int i = 0; i < AppGlobals::TAB_COUNT; ++i) {
         TCITEMW tie{};
         tie.mask = TCIF_TEXT;
@@ -1762,6 +1975,76 @@ static void CreateMainControls(HWND hwnd) {
                           g.mousePrecision, g.mouseRefresh, g.mouseApply, g.mouseReset, mNote };
     for (HWND h : g.tabControls[6]) SendMessageW(h, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
 
+    // ---- Tab 8: Engine (EMA smoothing + custom acceleration curve trên raw input) ----
+    g.engEnable = CreateWindowExW(0, L"BUTTON", L"Bật Mouse Engine (EMA smoothing + accel curve tùy chỉnh)",
+        WS_CHILD | BS_AUTOCHECKBOX, px, py, 560, 22, hwnd, (HMENU)(INT_PTR)IDC_ENG_ENABLE, g.hInst, nullptr);
+    g.engStatus = CreateWindowExW(0, L"STATIC", L"● TẮT", WS_CHILD, px + 570, py + 2, 100, 20, hwnd, nullptr, g.hInst, nullptr);
+
+    HWND eLbl1 = CreateWindowExW(0, L"STATIC", L"EMA Fast (0.0–10.0 ms):", WS_CHILD, px, py + 36, 220, 20, hwnd, nullptr, g.hInst, nullptr);
+    g.engEmaTrack = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | TBS_AUTOTICKS | TBS_HORZ,
+        px + 230, py + 32, 380, 30, hwnd, (HMENU)(INT_PTR)IDC_ENG_EMA, g.hInst, nullptr);
+    SendMessageW(g.engEmaTrack, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+    SendMessageW(g.engEmaTrack, TBM_SETPOS, TRUE, (LPARAM)(g_engine.emaFastMs * 10));
+    g.engEmaVal = CreateWindowExW(0, L"STATIC", L"2.0", WS_CHILD, px + 620, py + 36, 60, 20, hwnd, nullptr, g.hInst, nullptr);
+
+    HWND eLbl2 = CreateWindowExW(0, L"STATIC", L"Velocity Window (1–10 mẫu):", WS_CHILD, px, py + 68, 220, 20, hwnd, nullptr, g.hInst, nullptr);
+    g.engVelTrack = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | TBS_AUTOTICKS | TBS_HORZ,
+        px + 230, py + 64, 380, 30, hwnd, (HMENU)(INT_PTR)IDC_ENG_VELWIN, g.hInst, nullptr);
+    SendMessageW(g.engVelTrack, TBM_SETRANGE, TRUE, MAKELPARAM(1, 10));
+    SendMessageW(g.engVelTrack, TBM_SETPOS, TRUE, (LPARAM)g_engine.velWindow);
+    g.engVelVal = CreateWindowExW(0, L"STATIC", L"4", WS_CHILD, px + 620, py + 68, 60, 20, hwnd, nullptr, g.hInst, nullptr);
+
+    HWND eLbl3 = CreateWindowExW(0, L"STATIC", L"Micro Threshold (0.0–10.0 px):", WS_CHILD, px, py + 100, 220, 20, hwnd, nullptr, g.hInst, nullptr);
+    g.engMicroTrack = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | TBS_AUTOTICKS | TBS_HORZ,
+        px + 230, py + 96, 380, 30, hwnd, (HMENU)(INT_PTR)IDC_ENG_MICROTH, g.hInst, nullptr);
+    SendMessageW(g.engMicroTrack, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+    SendMessageW(g.engMicroTrack, TBM_SETPOS, TRUE, (LPARAM)(g_engine.microThresh * 10));
+    g.engMicroVal = CreateWindowExW(0, L"STATIC", L"2.0", WS_CHILD, px + 620, py + 100, 60, 20, hwnd, nullptr, g.hInst, nullptr);
+
+    HWND eLbl4 = CreateWindowExW(0, L"STATIC", L"Acceleration (0.00–0.50):", WS_CHILD, px, py + 132, 220, 20, hwnd, nullptr, g.hInst, nullptr);
+    g.engAccelTrack = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | TBS_AUTOTICKS | TBS_HORZ,
+        px + 230, py + 128, 380, 30, hwnd, (HMENU)(INT_PTR)IDC_ENG_ACCEL, g.hInst, nullptr);
+    SendMessageW(g.engAccelTrack, TBM_SETRANGE, TRUE, MAKELPARAM(0, 50));
+    SendMessageW(g.engAccelTrack, TBM_SETPOS, TRUE, (LPARAM)(g_engine.accel * 100));
+    g.engAccelVal = CreateWindowExW(0, L"STATIC", L"0.04", WS_CHILD, px + 620, py + 132, 60, 20, hwnd, nullptr, g.hInst, nullptr);
+
+    HWND eLbl5 = CreateWindowExW(0, L"STATIC", L"Accel Offset (0.0–20.0):", WS_CHILD, px, py + 164, 220, 20, hwnd, nullptr, g.hInst, nullptr);
+    g.engOffsetTrack = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | TBS_AUTOTICKS | TBS_HORZ,
+        px + 230, py + 160, 380, 30, hwnd, (HMENU)(INT_PTR)IDC_ENG_OFFSET, g.hInst, nullptr);
+    SendMessageW(g.engOffsetTrack, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
+    SendMessageW(g.engOffsetTrack, TBM_SETPOS, TRUE, (LPARAM)(g_engine.accelOffset * 10));
+    g.engOffsetVal = CreateWindowExW(0, L"STATIC", L"5.0", WS_CHILD, px + 620, py + 164, 60, 20, hwnd, nullptr, g.hInst, nullptr);
+
+    HWND eLbl6 = CreateWindowExW(0, L"STATIC", L"Accel Cap (1.00–3.00):", WS_CHILD, px, py + 196, 220, 20, hwnd, nullptr, g.hInst, nullptr);
+    g.engCapTrack = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | TBS_AUTOTICKS | TBS_HORZ,
+        px + 230, py + 192, 380, 30, hwnd, (HMENU)(INT_PTR)IDC_ENG_CAP, g.hInst, nullptr);
+    SendMessageW(g.engCapTrack, TBM_SETRANGE, TRUE, MAKELPARAM(100, 300));
+    SendMessageW(g.engCapTrack, TBM_SETPOS, TRUE, (LPARAM)(g_engine.accelCap * 100));
+    g.engCapVal = CreateWindowExW(0, L"STATIC", L"1.40", WS_CHILD, px + 620, py + 196, 60, 20, hwnd, nullptr, g.hInst, nullptr);
+
+    HWND eLbl7 = CreateWindowExW(0, L"STATIC", L"Ref DPI:", WS_CHILD, px, py + 232, 70, 20, hwnd, nullptr, g.hInst, nullptr);
+    g.engRefDpi = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"800", WS_CHILD | WS_BORDER | ES_NUMBER,
+        px + 74, py + 229, 80, 24, hwnd, (HMENU)(INT_PTR)IDC_ENG_REFDPI, g.hInst, nullptr);
+    HWND eLbl8 = CreateWindowExW(0, L"STATIC", L"Cur DPI:", WS_CHILD, px + 170, py + 232, 70, 20, hwnd, nullptr, g.hInst, nullptr);
+    g.engCurDpi = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"800", WS_CHILD | WS_BORDER | ES_NUMBER,
+        px + 244, py + 229, 80, 24, hwnd, (HMENU)(INT_PTR)IDC_ENG_CURDPI, g.hInst, nullptr);
+
+    g.engReset = CreateWindowExW(0, L"BUTTON", L"Khôi phục mặc định + Áp dụng", WS_CHILD,
+        px + 400, py + 228, 260, 28, hwnd, (HMENU)(INT_PTR)IDC_ENG_RESET, g.hInst, nullptr);
+
+    HWND eNote = CreateWindowExW(0, L"STATIC",
+        L"Cơ chế: đăng ký raw input (RIDEV_NOLEGACY) để tự xử lý delta chuột thô trước khi OS di chuyển con trỏ,\r\n"
+        L"rồi bơm lại bằng SendInput — thuần xử lý tín hiệu (giống RawAccel), KHÔNG đọc bộ nhớ/pixel của bất kỳ\r\n"
+        L"tiến trình game nào. Thay đổi tham số có hiệu lực NGAY khi kéo thanh trượt (không cần bấm Áp dụng), lúc\r\n"
+        L"engine đang bật. Nếu chuột bị \"lag\"/mất kiểm soát, bỏ tick \"Bật Mouse Engine\" để trả lại ngay lập tức.",
+        WS_CHILD | SS_LEFT, px, py + 268, 800, 80, hwnd, nullptr, g.hInst, nullptr);
+
+    g.tabControls[7] = { g.engEnable, g.engStatus, eLbl1, g.engEmaTrack, g.engEmaVal, eLbl2, g.engVelTrack, g.engVelVal,
+                          eLbl3, g.engMicroTrack, g.engMicroVal, eLbl4, g.engAccelTrack, g.engAccelVal,
+                          eLbl5, g.engOffsetTrack, g.engOffsetVal, eLbl6, g.engCapTrack, g.engCapVal,
+                          eLbl7, g.engRefDpi, eLbl8, g.engCurDpi, g.engReset, eNote };
+    for (HWND h : g.tabControls[7]) SendMessageW(h, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
+
     // ---- Log box ----
     g.hLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
@@ -1857,6 +2140,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             case IDC_MOUSE_APPLY:    OnMouseApply(); break;
             case IDC_MOUSE_RESET:    OnMouseReset(); break;
             case IDC_MOUSE_REFRESH:  OnMouseRefresh(); break;
+            case IDC_ENG_ENABLE:     OnEngToggle(); break;
+            case IDC_ENG_RESET:      OnEngReset(); break;
+            case IDC_ENG_REFDPI:     if (code == EN_CHANGE) EngineSyncFromControls(); break;
+            case IDC_ENG_CURDPI:     if (code == EN_CHANGE) EngineSyncFromControls(); break;
             default: break;
         }
         break;
@@ -1865,6 +2152,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         HWND ctl = (HWND)lParam;
         if (ctl == g.mouseSpeedTrack || ctl == g.mouseDblTrack || ctl == g.mouseWheelTrack || ctl == g.mouseTrailsTrack) {
             UpdateMouseLabelsFromTrackbars();
+        }
+        if (ctl == g.engEmaTrack || ctl == g.engVelTrack || ctl == g.engMicroTrack ||
+            ctl == g.engAccelTrack || ctl == g.engOffsetTrack || ctl == g.engCapTrack) {
+            EngineSyncFromControls();
         }
         break;
     }
@@ -1888,10 +2179,29 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         SetBkMode(hdc, TRANSPARENT);
         return (LRESULT)g.hBrushWindow;
     }
+    case WM_INPUT: {
+        if (g_engine.enabled.load()) {
+            UINT dwSize = sizeof(RAWINPUT);
+            static BYTE lpb[sizeof(RAWINPUT)];
+            if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, lpb, &dwSize, sizeof(RAWINPUTHEADER)) == dwSize) {
+                RAWINPUT* raw = (RAWINPUT*)lpb;
+                if (raw->header.dwType == RIM_TYPEMOUSE &&
+                    !(raw->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+                    MouseEngine_ProcessAndInject(raw->data.mouse.lLastX, raw->data.mouse.lLastY);
+                }
+            }
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        // An toàn: nếu Mouse Engine đang bật, luôn trả lại chuột mặc định Windows trước khi thoát.
+        if (g_engine.enabled.load() || g_engine.rawRegistered) {
+            g_engine.enabled = false;
+            MouseEngine_Unregister(hwnd);
+        }
         PostQuitMessage(0);
         return 0;
     }
