@@ -5,6 +5,9 @@
 #define _UNICODE
 #endif
 #define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX  // tránh macro min/max của windows.h phá std::min/std::max
+#endif
 
 #include <windows.h>
 #include <commctrl.h>
