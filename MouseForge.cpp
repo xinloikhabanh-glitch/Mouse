@@ -99,8 +99,14 @@ struct MouseEngineState {
     // Trạng thái nội bộ của bộ lọc (không phơi ra UI)
     double emaX = 0, emaY = 0;
     double carryX = 0, carryY = 0;
-    ULONGLONG lastTick = 0;
+    double lastMs = -1.0;            // thời điểm sự kiện trước (ms, steady_clock độ phân giải cao)
     std::deque<double> velHist;
+
+    // Cài đặt chuột gốc của Windows: SendInput relative bị OS áp accel/speed thêm lần nữa,
+    // nên khi engine bật phải tạm đặt 1:1 (speed 10, tắt precision) rồi khôi phục khi tắt.
+    bool savedOs = false;
+    INT savedMouse[3] = { 6, 10, 1 };
+    INT savedSpeed = 10;
 };
 static MouseEngineState g_engine;
 
@@ -109,11 +115,12 @@ static MouseEngineState g_engine;
 static void MouseEngine_ProcessAndInject(LONG dx, LONG dy) {
     if (dx == 0 && dy == 0) return;
 
-    ULONGLONG now = GetTickCount64();
-    double dt = g_engine.lastTick ? (double)(now - g_engine.lastTick) : 8.0;
-    if (dt <= 0.0) dt = 8.0;
-    if (dt > 100.0) dt = 100.0; // tránh nhảy số khi vừa bật lại sau khi đứng yên lâu
-    g_engine.lastTick = now;
+    double now = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    double dt = (g_engine.lastMs >= 0.0) ? (now - g_engine.lastMs) : 8.0;
+    if (dt < 0.05) dt = 0.05;    // chuột 8000Hz vẫn cho dt hợp lệ, tránh chia 0
+    if (dt > 100.0) dt = 100.0;  // tránh nhảy số khi vừa bật lại sau khi đứng yên lâu
+    g_engine.lastMs = now;
 
     double scale = (g_engine.curDpi > 0.0) ? (g_engine.refDpi / g_engine.curDpi) : 1.0;
     double fx = (double)dx * scale;
@@ -174,14 +181,27 @@ static bool MouseEngine_Register(HWND hwnd) {
     rid.usUsage = 0x02;     // Mouse
     rid.dwFlags = RIDEV_INPUTSINK | RIDEV_NOLEGACY;
     rid.hwndTarget = hwnd;
+    // Lưu cài đặt chuột hiện tại rồi đặt 1:1 (tạm thời, không ghi vào profile người dùng)
+    if (!g_engine.savedOs) {
+        SystemParametersInfoW(SPI_GETMOUSE, 0, g_engine.savedMouse, 0);
+        SystemParametersInfoW(SPI_GETMOUSESPEED, 0, &g_engine.savedSpeed, 0);
+        g_engine.savedOs = true;
+    }
+    INT flat[3] = { 0, 0, 0 };
+    SystemParametersInfoW(SPI_SETMOUSE, 0, flat, 0);
+    SystemParametersInfoW(SPI_SETMOUSESPEED, 0, (PVOID)(INT_PTR)10, 0);
+
     if (RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
         g_engine.rawRegistered = true;
         g_engine.emaX = g_engine.emaY = 0;
         g_engine.carryX = g_engine.carryY = 0;
-        g_engine.lastTick = 0;
+        g_engine.lastMs = -1.0;
         g_engine.velHist.clear();
         return true;
     }
+    SystemParametersInfoW(SPI_SETMOUSE, 0, g_engine.savedMouse, 0);
+    SystemParametersInfoW(SPI_SETMOUSESPEED, 0, (PVOID)(INT_PTR)g_engine.savedSpeed, 0);
+    g_engine.savedOs = false;
     return false;
 }
 
@@ -194,6 +214,37 @@ static void MouseEngine_Unregister(HWND hwnd) {
     rid.hwndTarget = nullptr;
     RegisterRawInputDevices(&rid, 1, sizeof(rid));
     g_engine.rawRegistered = false;
+    if (g_engine.savedOs) {
+        SystemParametersInfoW(SPI_SETMOUSE, 0, g_engine.savedMouse, 0);
+        SystemParametersInfoW(SPI_SETMOUSESPEED, 0, (PVOID)(INT_PTR)g_engine.savedSpeed, 0);
+        g_engine.savedOs = false;
+    }
+}
+
+// RIDEV_NOLEGACY chặn LUÔN cả click/cuộn của OS -> phải tự chuyển tiếp nút + bánh xe bằng SendInput.
+static void MouseEngine_ForwardButtons(const RAWMOUSE& m) {
+    USHORT f = m.usButtonFlags;
+    INPUT in[12]{};
+    int n = 0;
+    auto add = [&](DWORD flags, DWORD data = 0) {
+        in[n].type = INPUT_MOUSE;
+        in[n].mi.dwFlags = flags;
+        in[n].mi.mouseData = data;
+        n++;
+    };
+    if (f & RI_MOUSE_LEFT_BUTTON_DOWN)   add(MOUSEEVENTF_LEFTDOWN);
+    if (f & RI_MOUSE_LEFT_BUTTON_UP)     add(MOUSEEVENTF_LEFTUP);
+    if (f & RI_MOUSE_RIGHT_BUTTON_DOWN)  add(MOUSEEVENTF_RIGHTDOWN);
+    if (f & RI_MOUSE_RIGHT_BUTTON_UP)    add(MOUSEEVENTF_RIGHTUP);
+    if (f & RI_MOUSE_MIDDLE_BUTTON_DOWN) add(MOUSEEVENTF_MIDDLEDOWN);
+    if (f & RI_MOUSE_MIDDLE_BUTTON_UP)   add(MOUSEEVENTF_MIDDLEUP);
+    if (f & RI_MOUSE_BUTTON_4_DOWN)      add(MOUSEEVENTF_XDOWN, XBUTTON1);
+    if (f & RI_MOUSE_BUTTON_4_UP)        add(MOUSEEVENTF_XUP, XBUTTON1);
+    if (f & RI_MOUSE_BUTTON_5_DOWN)      add(MOUSEEVENTF_XDOWN, XBUTTON2);
+    if (f & RI_MOUSE_BUTTON_5_UP)        add(MOUSEEVENTF_XUP, XBUTTON2);
+    if (f & RI_MOUSE_WHEEL)              add(MOUSEEVENTF_WHEEL, (DWORD)(INT)(SHORT)m.usButtonData);
+    if (f & RI_MOUSE_HWHEEL)             add(MOUSEEVENTF_HWHEEL, (DWORD)(INT)(SHORT)m.usButtonData);
+    if (n > 0) SendInput((UINT)n, in, sizeof(INPUT));
 }
 
 // ===================== Globals =====================
@@ -1691,6 +1742,9 @@ static std::wstring FormatFixed(double v, int decimals) {
 // Đọc toàn bộ control của tab Engine -> đổ vào g_engine (áp dụng NGAY, kể cả khi engine đang chạy)
 // và cập nhật nhãn số hiển thị cạnh mỗi thanh trượt.
 static void EngineSyncFromControls() {
+    // EN_CHANGE có thể bắn khi control còn đang được tạo -> chưa có HWND
+    if (!g.engEmaTrack || !g.engVelTrack || !g.engMicroTrack || !g.engAccelTrack ||
+        !g.engOffsetTrack || !g.engCapTrack || !g.engRefDpi || !g.engCurDpi || !g.engCapVal) return;
     double ema = (double)SendMessageW(g.engEmaTrack, TBM_GETPOS, 0, 0) / 10.0;
     int velw = (int)SendMessageW(g.engVelTrack, TBM_GETPOS, 0, 0);
     double micro = (double)SendMessageW(g.engMicroTrack, TBM_GETPOS, 0, 0) / 10.0;
@@ -1712,7 +1766,7 @@ static void EngineSyncFromControls() {
     SetWindowTextW(g.engOffsetVal, FormatFixed(offset, 1).c_str());
     SetWindowTextW(g.engCapVal, FormatFixed(cap, 2).c_str());
 
-    wchar_t dpiBuf[16];
+    wchar_t dpiBuf[16] = {};
     GetWindowTextW(g.engRefDpi, dpiBuf, 16);
     double refDpi = _wtof(dpiBuf);
     if (refDpi >= 100.0 && refDpi <= 32000.0) g_engine.refDpi = refDpi;
@@ -2036,7 +2090,8 @@ static void CreateMainControls(HWND hwnd) {
         L"Cơ chế: đăng ký raw input (RIDEV_NOLEGACY) để tự xử lý delta chuột thô trước khi OS di chuyển con trỏ,\r\n"
         L"rồi bơm lại bằng SendInput — thuần xử lý tín hiệu (giống RawAccel), KHÔNG đọc bộ nhớ/pixel của bất kỳ\r\n"
         L"tiến trình game nào. Thay đổi tham số có hiệu lực NGAY khi kéo thanh trượt (không cần bấm Áp dụng), lúc\r\n"
-        L"engine đang bật. Nếu chuột bị \"lag\"/mất kiểm soát, bỏ tick \"Bật Mouse Engine\" để trả lại ngay lập tức.",
+        L"engine đang bật. Nếu chuột bị \"lag\"/mất kiểm soát: bỏ tick \"Bật Mouse Engine\" hoặc bấm phím cứu hộ Ctrl+Alt+F7.\r\n"
+        L"Khi bật, app tạm đặt speed=10 + tắt precision của Windows để tránh accel chồng accel (tự khôi phục khi tắt).",
         WS_CHILD | SS_LEFT, px, py + 268, 800, 80, hwnd, nullptr, g.hInst, nullptr);
 
     g.tabControls[7] = { g.engEnable, g.engStatus, eLbl1, g.engEmaTrack, g.engEmaVal, eLbl2, g.engVelTrack, g.engVelVal,
@@ -2078,6 +2133,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         FillConfigList();
         RefreshPresetCombo();
         OnMouseRefresh();
+        RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT, VK_F7);
         log_line(L"[App] Mouse Forge đã khởi động");
         if (!g.admin) {
             log_line(L"[App] cảnh báo: chưa chạy với quyền Administrator, ghi config/priority sẽ bị chặn");
@@ -2181,23 +2237,33 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
     case WM_INPUT: {
         if (g_engine.enabled.load()) {
-            UINT dwSize = sizeof(RAWINPUT);
-            static BYTE lpb[sizeof(RAWINPUT)];
-            if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, lpb, &dwSize, sizeof(RAWINPUTHEADER)) == dwSize) {
-                RAWINPUT* raw = (RAWINPUT*)lpb;
-                if (raw->header.dwType == RIM_TYPEMOUSE &&
-                    !(raw->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
-                    MouseEngine_ProcessAndInject(raw->data.mouse.lLastX, raw->data.mouse.lLastY);
+            RAWINPUT raw{};
+            UINT dwSize = sizeof(raw);
+            UINT got = GetRawInputData((HRAWINPUT)lParam, RID_INPUT, &raw, &dwSize, sizeof(RAWINPUTHEADER));
+            // hDevice == NULL nghĩa là sự kiện do SendInput bơm vào (chính engine) -> bỏ qua, tránh vòng lặp vô hạn
+            if (got != (UINT)-1 && raw.header.dwType == RIM_TYPEMOUSE && raw.header.hDevice != nullptr) {
+                if (!(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+                    MouseEngine_ProcessAndInject(raw.data.mouse.lLastX, raw.data.mouse.lLastY);
                 }
+                MouseEngine_ForwardButtons(raw.data.mouse);
             }
         }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
+    case WM_HOTKEY:
+        // Phím tắt cứu hộ Ctrl+Alt+F7: tắt engine ngay kể cả khi chuột đang không dùng được
+        if (wParam == 1 && g_engine.enabled.load()) {
+            SendMessageW(g.engEnable, BM_SETCHECK, BST_UNCHECKED, 0);
+            OnEngToggle();
+            log_line(L"[Engine] đã tắt bằng phím tắt Ctrl+Alt+F7");
+        }
+        return 0;
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
         // An toàn: nếu Mouse Engine đang bật, luôn trả lại chuột mặc định Windows trước khi thoát.
+        UnregisterHotKey(hwnd, 1);
         if (g_engine.enabled.load() || g_engine.rawRegistered) {
             g_engine.enabled = false;
             MouseEngine_Unregister(hwnd);

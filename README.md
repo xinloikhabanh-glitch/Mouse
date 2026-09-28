@@ -31,6 +31,15 @@ windres resource.rc -O coff -o resource.res
 g++ -std=c++17 -O2 -municode -mwindows MouseForge.cpp resource.res -o MouseForge.exe -lshlwapi -lpsapi -lcomctl32 -lgdi32 -luser32 -ldwmapi -ladvapi32
 ```
 
+## Tab "Engine" (mới)
+Đăng ký raw mouse input (`RIDEV_NOLEGACY`) để tự xử lý delta chuột thô trước khi Windows di chuyển con trỏ, rồi bơm chuyển động đã xử lý bằng `SendInput` — đúng kỹ thuật RawAccel dùng, **không đọc bộ nhớ/pixel của bất kỳ tiến trình game nào**:
+- **EMA Fast**: bộ lọc làm mượt rung tay (time-normalized exponential moving average)
+- **Velocity Window**: số mẫu tốc độ dùng để tính trung bình trượt
+- **Micro Threshold**: ngưỡng bỏ qua lọc/accel khi di chuyển siêu nhỏ (giữ độ chính xác lúc ngắm tĩnh)
+- **Acceleration / Accel Offset / Accel Cap**: đường cong gia tốc tuỳ chỉnh
+- **Ref DPI / Cur DPI**: quy đổi khi đổi DPI chuột thật
+- Tham số áp dụng NGAY khi kéo thanh trượt; tắt tick "Bật Mouse Engine" để trả về mặc định Windows ngay lập tức. Tự động unregister khi app đóng (kể cả khi đóng đột ngột qua WM_DESTROY).
+
 ## Mới trong v2
 - Tab **Presets**: lưu/nạp nhiều bộ lựa chọn checkbox ở tab Tối ưu thành các preset đặt tên riêng (ví dụ "Game nhẹ", "Game nặng"), lưu dưới dạng file text trong thư mục `presets/` cạnh file .exe.
 - Thêm 3 tuỳ chọn tối ưu mới (đều là key AOSP thật, có scope `system`):
