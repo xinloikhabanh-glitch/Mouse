@@ -6,8 +6,8 @@
 1 24 "app.manifest"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,0,0,0
-PRODUCTVERSION  1,0,0,0
+FILEVERSION     3,0,0,0
+PRODUCTVERSION  3,0,0,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          0x40004L
@@ -19,9 +19,9 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "FileDescription", "Mouse Forge - BlueStacks Tuning Panel"
-            VALUE "FileVersion",     "1.0.0.0"
+            VALUE "FileVersion",     "3.0.0.0"
             VALUE "ProductName",     "Mouse Forge"
-            VALUE "ProductVersion",  "1.0.0.0"
+            VALUE "ProductVersion",  "3.0.0.0"
         END
     END
     BLOCK "VarFileInfo"

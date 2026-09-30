@@ -15,6 +15,7 @@
 #include <psapi.h>
 #include <dwmapi.h>
 #include <shlwapi.h>
+#include <uxtheme.h>
 
 #include <string>
 #include <vector>
@@ -40,6 +41,7 @@
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "uxtheme.lib")
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -74,36 +76,64 @@ enum {
     IDC_ENG_ENABLE, IDC_ENG_EMA, IDC_ENG_VELWIN, IDC_ENG_MICROTH, IDC_ENG_ACCEL,
     IDC_ENG_OFFSET, IDC_ENG_CAP, IDC_ENG_REFDPI, IDC_ENG_CURDPI, IDC_ENG_RESET,
 
+    IDC_THEME_TOGGLE,
+    IDC_QS_TOGGLE, IDC_QS_P1, IDC_QS_P2, IDC_QS_P3, IDC_QS_P4, IDC_QS_P5,
+    IDC_TEST_RESET, IDC_TEST_WATCHDOG, IDC_TEST_CLICKPAD,
+    IDC_GUIDE_TEXT,
+
     IDC_DLG_KEY_LBL, IDC_DLG_KEY, IDC_DLG_VAL_LBL, IDC_DLG_VAL, IDC_DLG_OK, IDC_DLG_CANCEL,
 };
 
+// Nút tab tự vẽ: ID liên tục từ IDC_TABBTN_BASE (không trùng enum ở trên)
+static const int IDC_TABBTN_BASE = 2000;
+
 // Layout: chiều cao vùng header tiêu đề ở trên cùng, và vị trí Y của tab control bên dưới header.
-static const int kHeaderTop = 10;
-static const int kHeaderH = 34;
-static const int kTabTop = kHeaderTop + kHeaderH + 10; // = 54
+static const int kHeaderTop = 6;
+static const int kHeaderH = 52;
+static const int kTabTop = kHeaderTop + kHeaderH + 4;      // y của thanh tab tự vẽ
+static const int kTabBarH = 30;
+static const int kContentTop = kTabTop + kTabBarH + 16;    // y bắt đầu nội dung mỗi tab
+static const int kStatusH = 24;                            // dải trạng thái dưới cùng (tự vẽ)
 
 // ===================== Mouse Engine (EMA smoothing + custom acceleration curve) =====================
 // Hoạt động thuần ở tầng raw input <-> OS cursor, giống RawAccel: không đọc bộ nhớ/pixel của bất kỳ
 // tiến trình nào, không biết "target" ở đâu. Chỉ biến đổi delta chuột thô trước khi OS di chuyển con trỏ.
+// Dấu hiệu nhận biết sự kiện do CHÍNH engine bơm vào (SendInput) để không xử lý lại -> chống vòng lặp tự khuếch đại.
+static const ULONG_PTR kInjectTag = 0x4D465233; // "MFR3"
+static const UINT WM_APP_TRIP = WM_APP + 1;      // engine tự ngắt (bộ bảo vệ)
+static const UINT_PTR kTimerFlush = 2;           // xả nốt phần dư của bộ làm mượt khi ngừng di chuột
+static const UINT_PTR kTimerStats = 3;           // cập nhật số liệu tab Test
+static HWND g_engineNotifyWnd = nullptr;
+
 struct MouseEngineState {
     std::atomic<bool> enabled{false};
     bool rawRegistered = false;
+    bool watchdogOn = true;
+    bool tripped = false;
 
     // Tham số (đơn vị thật; lưu double, UI dùng trackbar int đã nhân hệ số)
-    double emaFastMs   = 2.0;   // 0.0 - 10.0
+    double emaFastMs   = 2.0;   // 0.0 - 10.0 ms
     int    velWindow    = 4;     // 1 - 10 mẫu
-    double microThresh  = 2.0;   // 0.0 - 10.0 px
+    double microThresh  = 2.0;   // 0.0 - 10.0 counts/sự kiện
     double accel        = 0.04;  // 0.00 - 0.50
-    double accelOffset  = 5.0;   // 0.0 - 20.0
+    double accelOffset  = 5.0;   // 0.0 - 20.0 counts/ms
     double accelCap     = 1.40;  // 1.00 - 3.00
     double refDpi       = 800.0;
     double curDpi       = 800.0;
 
-    // Trạng thái nội bộ của bộ lọc (không phơi ra UI)
-    double emaX = 0, emaY = 0;
-    double carryX = 0, carryY = 0;
-    double lastMs = -1.0;            // thời điểm sự kiện trước (ms, steady_clock độ phân giải cao)
-    std::deque<double> velHist;
+    // Trạng thái nội bộ của bộ lọc
+    double pendX = 0, pendY = 0;     // phần chuyển động chưa "xả" của bộ làm mượt (bảo toàn tổng quãng đường)
+    double carryX = 0, carryY = 0;   // phần dư thập phân khi làm tròn ra số nguyên
+    double lastMs = -1.0;
+    struct Sample { double dist; double dt; };
+    std::deque<Sample> hist;
+
+    // Bộ bảo vệ chống chuột mất kiểm soát
+    double wdStart = -1.0, wdIn = 0, wdOut = 0, wdRaw = 0;
+
+    // Số liệu cho tab Test
+    double stIn = 0, stOut = 0, stMult = 1.0, stVel = 0.0;
+    long   stEvents = 0;
 
     // Cài đặt chuột gốc của Windows: SendInput relative bị OS áp accel/speed thêm lần nữa,
     // nên khi engine bật phải tạm đặt 1:1 (speed 10, tắt precision) rồi khôi phục khi tắt.
@@ -113,67 +143,146 @@ struct MouseEngineState {
 };
 static MouseEngineState g_engine;
 
-// Xử lý 1 sự kiện raw mouse delta: EMA smoothing (time-normalized) + đường cong gia tốc tùy chỉnh,
-// rồi bơm lại chuyển động đã xử lý vào OS bằng SendInput (relative move).
+static double NowMs() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void EngineSendMove(int mx, int my) {
+    if (mx == 0 && my == 0) return;
+    INPUT in{};
+    in.type = INPUT_MOUSE;
+    in.mi.dx = mx;
+    in.mi.dy = my;
+    in.mi.dwFlags = MOUSEEVENTF_MOVE;
+    in.mi.dwExtraInfo = kInjectTag;
+    SendInput(1, &in, sizeof(INPUT));
+}
+
+// Xử lý 1 sự kiện raw mouse delta: làm mượt (bảo toàn quãng đường) + đường cong gia tốc tùy chỉnh,
+// rồi bơm chuyển động đã xử lý vào OS bằng SendInput (relative move).
 static void MouseEngine_ProcessAndInject(LONG dx, LONG dy) {
+    if (!g_engine.enabled.load()) return;
     if (dx == 0 && dy == 0) return;
 
-    double now = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    double dt = (g_engine.lastMs >= 0.0) ? (now - g_engine.lastMs) : 8.0;
+    double now = NowMs();
+    double dt = (g_engine.lastMs >= 0.0) ? (now - g_engine.lastMs) : 4.0;
     if (dt < 0.05) dt = 0.05;    // chuột 8000Hz vẫn cho dt hợp lệ, tránh chia 0
-    if (dt > 100.0) dt = 100.0;  // tránh nhảy số khi vừa bật lại sau khi đứng yên lâu
+    if (dt > 100.0) dt = 100.0;  // vừa bật lại sau khi đứng yên lâu
     g_engine.lastMs = now;
 
     double scale = (g_engine.curDpi > 0.0) ? (g_engine.refDpi / g_engine.curDpi) : 1.0;
+    if (scale < 0.05) scale = 0.05;
+    if (scale > 20.0) scale = 20.0;
     double fx = (double)dx * scale;
     double fy = (double)dy * scale;
     double dist = std::sqrt(fx * fx + fy * fy);
 
-    // Micro-threshold: chuyển động cực nhỏ (rung tay) thì bỏ qua EMA/curve, đi thẳng 1:1 để không mất độ chính xác khi ngắm tĩnh
-    double outX, outY;
-    if (dist <= g_engine.microThresh) {
-        outX = fx; outY = fy;
-        g_engine.emaX = fx; g_engine.emaY = fy; // đồng bộ lại bộ lọc, tránh giật khi tăng tốc trở lại
+    // --- Làm mượt: bộ lọc trễ BẢO TOÀN tổng quãng đường (không mất/không thêm counts) ---
+    // Mỗi sự kiện chỉ "xả" một phần alpha của lượng chưa xả; phần còn lại xả ở sự kiện sau hoặc bởi timer khi ngừng.
+    double alpha = 1.0;
+    if (g_engine.emaFastMs > 0.05) alpha = 1.0 - std::exp(-dt / g_engine.emaFastMs);
+    double sx, sy;
+    if (dist <= g_engine.microThresh || alpha >= 0.98) {
+        // Chuyển động cực nhỏ (ngắm tĩnh) hoặc không làm mượt: đi thẳng 1:1, xả luôn phần chờ
+        sx = g_engine.pendX + fx;
+        sy = g_engine.pendY + fy;
+        g_engine.pendX = g_engine.pendY = 0;
     } else {
-        // EMA time-normalized: alpha phụ thuộc dt để tốc độ khung hình không ảnh hưởng độ mượt
-        double alpha = 1.0 - std::exp(-dt / (g_engine.emaFastMs > 0.01 ? g_engine.emaFastMs : 0.01));
-        g_engine.emaX += alpha * (fx - g_engine.emaX);
-        g_engine.emaY += alpha * (fy - g_engine.emaY);
-        outX = g_engine.emaX; outY = g_engine.emaY;
+        g_engine.pendX += fx;
+        g_engine.pendY += fy;
+        sx = g_engine.pendX * alpha;
+        sy = g_engine.pendY * alpha;
+        g_engine.pendX -= sx;
+        g_engine.pendY -= sy;
     }
 
-    // Velocity trung bình trượt (px/ms) để quyết định hệ số gia tốc
-    double vel = dist / dt;
-    g_engine.velHist.push_back(vel);
-    while ((int)g_engine.velHist.size() > std::max(1, g_engine.velWindow)) g_engine.velHist.pop_front();
-    double avgVel = 0;
-    for (double v : g_engine.velHist) avgVel += v;
-    avgVel /= (double)g_engine.velHist.size();
+    // --- Tốc độ (counts/ms) trung bình trượt để quyết định hệ số gia tốc ---
+    g_engine.hist.push_back({ dist, dt });
+    while ((int)g_engine.hist.size() > (std::max)(1, g_engine.velWindow)) g_engine.hist.pop_front();
+    double sumD = 0, sumT = 0;
+    for (const auto& sm : g_engine.hist) { sumD += sm.dist; sumT += sm.dt; }
+    double vel = sumD / (std::max)(sumT, 1.0);
 
     double mult = 1.0;
-    if (avgVel > g_engine.accelOffset) {
-        mult = 1.0 + g_engine.accel * (avgVel - g_engine.accelOffset);
+    if (g_engine.accel > 0.0 && vel > g_engine.accelOffset) {
+        mult = 1.0 + g_engine.accel * (vel - g_engine.accelOffset);
         if (mult > g_engine.accelCap) mult = g_engine.accelCap;
     }
-    outX *= mult; outY *= mult;
+    if (mult < 1.0) mult = 1.0;
+    g_engine.stMult = mult;
+    g_engine.stVel = vel;
 
-    // Giữ phần dư thập phân để không mất độ chính xác khi làm tròn xuống pixel nguyên
-    g_engine.carryX += outX;
-    g_engine.carryY += outY;
-    int moveX = (int)g_engine.carryX;
-    int moveY = (int)g_engine.carryY;
-    g_engine.carryX -= moveX;
-    g_engine.carryY -= moveY;
+    // --- Làm tròn giữ phần dư ---
+    g_engine.carryX += sx * mult;
+    g_engine.carryY += sy * mult;
+    int mx = (int)g_engine.carryX;
+    int my = (int)g_engine.carryY;
+    g_engine.carryX -= mx;
+    g_engine.carryY -= my;
+    if (mx > 2000) mx = 2000;
+    if (mx < -2000) mx = -2000;
+    if (my > 2000) my = 2000;
+    if (my < -2000) my = -2000;
+    EngineSendMove(mx, my);
 
-    if (moveX != 0 || moveY != 0) {
-        INPUT input{};
-        input.type = INPUT_MOUSE;
-        input.mi.dx = moveX;
-        input.mi.dy = moveY;
-        input.mi.dwFlags = MOUSEEVENTF_MOVE;
-        SendInput(1, &input, sizeof(INPUT));
+    // --- Số liệu + bộ bảo vệ ---
+    double outMag = std::sqrt((double)mx * mx + (double)my * my);
+    g_engine.stIn += dist;
+    g_engine.stOut += outMag;
+    g_engine.stEvents++;
+
+    if (g_engine.wdStart < 0.0) g_engine.wdStart = now;
+    g_engine.wdIn += dist;
+    g_engine.wdOut += outMag;
+    g_engine.wdRaw += std::sqrt((double)dx * dx + (double)dy * dy);
+    if (now - g_engine.wdStart >= 200.0) {
+        bool trip = false;
+        if (g_engine.watchdogOn) {
+            // (1) Ngõ ra lớn hơn ngõ vào nhiều lần so với mức hệ số tối đa cho phép -> đang tự khuếch đại
+            double maxRatio = g_engine.accelCap + 2.0;
+            if (g_engine.wdOut > g_engine.wdIn * maxRatio + 300.0) trip = true;
+            // (2) Tốc độ vật lý bất khả thi trong 200ms (vd chuột "tự chạy") so với DPI đã khai báo
+            double dpi = (g_engine.curDpi > 0.0) ? g_engine.curDpi : 800.0;
+            if (g_engine.wdRaw > dpi * 80.0) trip = true;
+        }
+        g_engine.wdStart = now;
+        g_engine.wdIn = g_engine.wdOut = g_engine.wdRaw = 0;
+        if (trip) {
+            g_engine.enabled = false;
+            g_engine.tripped = true;
+            if (g_engineNotifyWnd) PostMessageW(g_engineNotifyWnd, WM_APP_TRIP, 0, 0);
+        }
     }
+}
+
+// Gọi định kỳ (timer 10ms): khi đã ngừng di chuột vài ms thì xả nốt phần dư của bộ làm mượt để con trỏ không dừng thiếu vài counts.
+static void MouseEngine_Flush() {
+    if (!g_engine.enabled.load()) return;
+    double now = NowMs();
+    if (g_engine.lastMs < 0.0 || now - g_engine.lastMs < 6.0) return;
+    if (std::fabs(g_engine.pendX) + std::fabs(g_engine.pendY) < 0.01) return;
+    g_engine.carryX += g_engine.pendX;
+    g_engine.carryY += g_engine.pendY;
+    g_engine.pendX = g_engine.pendY = 0;
+    int mx = (int)std::lround(g_engine.carryX);
+    int my = (int)std::lround(g_engine.carryY);
+    g_engine.carryX -= mx;
+    g_engine.carryY -= my;
+    EngineSendMove(mx, my);
+}
+
+static void MouseEngine_ResetState() {
+    g_engine.pendX = g_engine.pendY = 0;
+    g_engine.carryX = g_engine.carryY = 0;
+    g_engine.lastMs = -1.0;
+    g_engine.hist.clear();
+    g_engine.wdStart = -1.0;
+    g_engine.wdIn = g_engine.wdOut = g_engine.wdRaw = 0;
+    g_engine.stIn = g_engine.stOut = 0;
+    g_engine.stEvents = 0;
+    g_engine.stMult = 1.0;
+    g_engine.stVel = 0.0;
+    g_engine.tripped = false;
 }
 
 // Đăng ký raw input: RIDEV_INPUTSINK để nhận cả khi cửa sổ không active, RIDEV_NOLEGACY để OS
@@ -194,12 +303,9 @@ static bool MouseEngine_Register(HWND hwnd) {
     SystemParametersInfoW(SPI_SETMOUSE, 0, flat, 0);
     SystemParametersInfoW(SPI_SETMOUSESPEED, 0, (PVOID)(INT_PTR)10, 0);
 
+    MouseEngine_ResetState();
     if (RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
         g_engine.rawRegistered = true;
-        g_engine.emaX = g_engine.emaY = 0;
-        g_engine.carryX = g_engine.carryY = 0;
-        g_engine.lastMs = -1.0;
-        g_engine.velHist.clear();
         return true;
     }
     SystemParametersInfoW(SPI_SETMOUSE, 0, g_engine.savedMouse, 0);
@@ -209,7 +315,7 @@ static bool MouseEngine_Register(HWND hwnd) {
 }
 
 // Gỡ đăng ký raw input -> trả lại hành vi chuột mặc định của Windows ngay lập tức.
-static void MouseEngine_Unregister(HWND hwnd) {
+static void MouseEngine_Unregister(HWND) {
     RAWINPUTDEVICE rid{};
     rid.usUsagePage = 0x01;
     rid.usUsage = 0x02;
@@ -233,6 +339,7 @@ static void MouseEngine_ForwardButtons(const RAWMOUSE& m) {
         in[n].type = INPUT_MOUSE;
         in[n].mi.dwFlags = flags;
         in[n].mi.mouseData = data;
+        in[n].mi.dwExtraInfo = kInjectTag;
         n++;
     };
     if (f & RI_MOUSE_LEFT_BUTTON_DOWN)   add(MOUSEEVENTF_LEFTDOWN);
@@ -304,10 +411,253 @@ struct AppGlobals {
     HBRUSH hBrushHeader = nullptr;
     HBRUSH hBrushWindow = nullptr;
 
-    static constexpr int TAB_COUNT = 8;
+    // v3: giao diện mới
+    HFONT hFontBold = nullptr;
+    HWND themeToggle = nullptr;
+    int engState = 0;        // 0 = tắt, 1 = bật, 2 = đã tự ngắt do bộ bảo vệ
+    int verdictLevel = 3;    // 0 tốt, 1 cảnh báo, 2 nguy hiểm, 3 chưa đo
+    std::vector<HWND> accentLabels, mutedLabels;
+
+    HWND qsToggle = nullptr, qsStatus = nullptr;
+    HWND testVals[6] = {};
+    HWND testVerdict = nullptr, testWatchdog = nullptr, testReset = nullptr, testClickPad = nullptr;
+    int testClicks = 0;
+    HWND guideText = nullptr;
+
+    static constexpr int TAB_COUNT = 11;
     std::vector<HWND> tabControls[TAB_COUNT];
 };
 static AppGlobals g;
+
+// Thứ tự HIỂN THỊ của các nút tab -> chỉ số nội dung (tabControls[...]). Tab đơn giản đặt trước, nâng cao đặt sau.
+static const int kTabContentIdx[AppGlobals::TAB_COUNT] = { 8, 7, 9, 6, 2, 5, 0, 1, 3, 10, 4 };
+static const wchar_t* const kTabNames[AppGlobals::TAB_COUNT] = {
+    L"Bắt đầu", L"Engine", L"Test", L"Chuột", L"Tối ưu", L"Presets", L"Config", L"ADB", L"Root", L"Hướng dẫn", L"Thông tin"
+};
+
+// ===================== Theme (Tối / Sáng) =====================
+struct Theme {
+    COLORREF bg, panel, text, muted, accent, accentText, btn, border, edit, good, warn, bad;
+};
+static const Theme kThemeDark  = { RGB(13,17,23),  RGB(22,27,34),  RGB(230,237,243), RGB(139,148,158), RGB(0,207,232),
+                                   RGB(2,24,30),   RGB(33,38,45),  RGB(56,63,72),    RGB(22,27,34),
+                                   RGB(63,185,80), RGB(210,153,34), RGB(248,81,73) };
+static const Theme kThemeLight = { RGB(244,246,249), RGB(255,255,255), RGB(24,32,44),   RGB(96,108,124), RGB(0,120,212),
+                                   RGB(255,255,255), RGB(228,233,240), RGB(202,209,219), RGB(255,255,255),
+                                   RGB(26,127,55), RGB(154,103,0),  RGB(207,34,46) };
+static bool g_dark = true;
+static const Theme& Th() { return g_dark ? kThemeDark : kThemeLight; }
+static HBRUSH g_brBg[2] = { nullptr, nullptr };
+static HBRUSH g_brEdit[2] = { nullptr, nullptr };
+static HBRUSH BrBg()   { return g_brBg[g_dark ? 0 : 1]; }
+static HBRUSH BrEdit() { return g_brEdit[g_dark ? 0 : 1]; }
+static void CreateThemeBrushes() {
+    g_brBg[0] = CreateSolidBrush(kThemeDark.bg);
+    g_brBg[1] = CreateSolidBrush(kThemeLight.bg);
+    g_brEdit[0] = CreateSolidBrush(kThemeDark.edit);
+    g_brEdit[1] = CreateSolidBrush(kThemeLight.edit);
+}
+static COLORREF Shade(COLORREF c, int d) {
+    auto cl = [](int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); };
+    return RGB(cl(GetRValue(c) + d), cl(GetGValue(c) + d), cl(GetBValue(c) + d));
+}
+
+static bool IsPresetBtn(int id)  { return id >= IDC_QS_P1 && id <= IDC_QS_P5; }
+static bool IsPrimaryBtn(int id) {
+    return id == IDC_QS_TOGGLE || id == IDC_MOUSE_APPLY || id == IDC_OPT_SCAN || id == IDC_PRESET_SAVE ||
+           id == IDC_ADB_CONNECT || id == IDC_DLG_OK || id == IDC_ENG_RESET;
+}
+
+// Vẽ nút BUTTON tự vẽ (BS_OWNERDRAW): nút thường, nút chính (màu nhấn), thẻ preset 2 dòng, và nút tab.
+static void DrawOwnerButton(const DRAWITEMSTRUCT* d) {
+    const Theme& t = Th();
+    HDC dc = d->hDC;
+    RECT rc = d->rcItem;
+    int id = (int)d->CtlID;
+    wchar_t buf[256] = {};
+    GetWindowTextW(d->hwndItem, buf, 256);
+    std::wstring txt(buf);
+    bool pressed = (d->itemState & ODS_SELECTED) != 0;
+    HFONT fUI = g.hFontUI ? g.hFontUI : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HFONT fBold = g.hFontBold ? g.hFontBold : fUI;
+
+    FillRect(dc, &rc, BrBg());
+    SetBkMode(dc, TRANSPARENT);
+    HFONT oldFont = (HFONT)SelectObject(dc, fUI);
+
+    if (id >= IDC_TABBTN_BASE && id < IDC_TABBTN_BASE + AppGlobals::TAB_COUNT) {
+        bool sel = (id - IDC_TABBTN_BASE) == g.curTab;
+        SelectObject(dc, sel ? fBold : fUI);
+        SetTextColor(dc, sel ? t.accent : t.muted);
+        RECT tr = rc;
+        DrawTextW(dc, txt.c_str(), -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (sel) {
+            RECT ul = { rc.left + 6, rc.bottom - 3, rc.right - 6, rc.bottom };
+            HBRUSH b = CreateSolidBrush(t.accent);
+            FillRect(dc, &ul, b);
+            DeleteObject(b);
+        }
+        SelectObject(dc, oldFont);
+        return;
+    }
+
+    bool primary = IsPrimaryBtn(id);
+    COLORREF fill = primary ? t.accent : t.btn;
+    COLORREF txtCol = primary ? t.accentText : t.text;
+    if (id == IDC_QS_TOGGLE && g.engState == 1) { fill = t.bad; txtCol = RGB(255, 255, 255); }
+    if (pressed) fill = Shade(fill, -24);
+    COLORREF border = primary ? fill : t.border;
+
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, border);
+    HGDIOBJ ob = SelectObject(dc, br);
+    HGDIOBJ op = SelectObject(dc, pen);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 10, 10);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(br);
+    DeleteObject(pen);
+
+    size_t nl = txt.find(L'\n');
+    if (nl != std::wstring::npos) {
+        std::wstring l1 = txt.substr(0, nl), l2 = txt.substr(nl + 1);
+        UINT al = IsPresetBtn(id) ? DT_LEFT : DT_CENTER;
+        RECT r1 = { rc.left + 14, rc.top + 8,  rc.right - 14, rc.top + 30 };
+        RECT r2 = { rc.left + 14, rc.top + 30, rc.right - 14, rc.bottom - 6 };
+        SelectObject(dc, fBold);
+        SetTextColor(dc, txtCol);
+        DrawTextW(dc, l1.c_str(), -1, &r1, al | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(dc, fUI);
+        SetTextColor(dc, primary ? Shade(txtCol, 40) : t.muted);
+        DrawTextW(dc, l2.c_str(), -1, &r2, al | DT_WORDBREAK);
+    } else {
+        SetTextColor(dc, txtCol);
+        SelectObject(dc, primary ? fBold : fUI);
+        RECT tr = rc;
+        DrawTextW(dc, txt.c_str(), -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    SelectObject(dc, oldFont);
+}
+
+static bool HwndIn(const std::vector<HWND>& v, HWND h) { return std::find(v.begin(), v.end(), h) != v.end(); }
+
+// Màu nền/chữ cho STATIC, EDIT, LISTBOX, trackbar... theo theme hiện tại. Dùng chung cho cửa sổ chính và hộp thoại.
+static LRESULT ThemeCtlColor(UINT msg, HDC hdc, HWND ctl) {
+    const Theme& t = Th();
+    if (msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORLISTBOX) {
+        SetTextColor(hdc, t.text);
+        SetBkColor(hdc, t.edit);
+        return (LRESULT)BrEdit();
+    }
+    wchar_t cls[16] = {};
+    GetClassNameW(ctl, cls, 16);
+    if (lstrcmpiW(cls, L"Edit") == 0) {           // EDIT chỉ-đọc (log, thông tin, hướng dẫn) cũng gửi WM_CTLCOLORSTATIC
+        SetTextColor(hdc, t.text);
+        SetBkColor(hdc, t.edit);
+        return (LRESULT)BrEdit();
+    }
+    COLORREF col = t.text;
+    if (ctl == g.engStatus || ctl == g.qsStatus) col = g.engState == 1 ? t.good : (g.engState == 2 ? t.bad : t.muted);
+    else if (ctl == g.testVerdict) col = g.verdictLevel == 0 ? t.good : (g.verdictLevel == 1 ? t.warn : (g.verdictLevel == 2 ? t.bad : t.muted));
+    else if (HwndIn(g.accentLabels, ctl)) col = t.accent;
+    else if (HwndIn(g.mutedLabels, ctl)) col = t.muted;
+    SetTextColor(hdc, col);
+    SetBkColor(hdc, t.bg);
+    SetBkMode(hdc, TRANSPARENT);
+    return (LRESULT)BrBg();
+}
+
+// Vẽ phần header (tên app + trạng thái engine), đường kẻ dưới thanh tab và dải trạng thái dưới cùng.
+static void PaintMain(HWND hwnd) {
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(hwnd, &ps);
+    const Theme& t = Th();
+    RECT client;
+    GetClientRect(hwnd, &client);
+    SetBkMode(dc, TRANSPARENT);
+
+    HFONT fUI = g.hFontUI ? g.hFontUI : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HFONT fBold = g.hFontBold ? g.hFontBold : fUI;
+    HFONT fTitle = g.hFontTitle ? g.hFontTitle : fBold;
+    HFONT oldFont = (HFONT)SelectObject(dc, fTitle);
+
+    SetTextColor(dc, t.accent);
+    TextOutW(dc, 16, kHeaderTop + 2, L"Mouse Forge", 11);
+    SelectObject(dc, fUI);
+    SetTextColor(dc, t.muted);
+    const wchar_t* sub = L"Bộ tinh chỉnh chuột & BlueStacks  •  v3";
+    TextOutW(dc, 18, kHeaderTop + 34, sub, lstrlenW(sub));
+
+    // Chip trạng thái engine (vẽ bằng hình tròn, không phụ thuộc glyph của font)
+    COLORREF pc = g.engState == 1 ? t.good : (g.engState == 2 ? t.bad : t.muted);
+    const wchar_t* pt = g.engState == 1 ? L"ENGINE ĐANG BẬT" : (g.engState == 2 ? L"ĐÃ TỰ NGẮT (BẢO VỆ)" : L"ENGINE TẮT");
+    RECT pill = { 540, kHeaderTop + 10, 762, kHeaderTop + 38 };
+    HBRUSH pb = CreateSolidBrush(t.panel);
+    HPEN pp = CreatePen(PS_SOLID, 1, pc);
+    HGDIOBJ ob = SelectObject(dc, pb);
+    HGDIOBJ op = SelectObject(dc, pp);
+    RoundRect(dc, pill.left, pill.top, pill.right, pill.bottom, 28, 28);
+    HBRUSH dotB = CreateSolidBrush(pc);
+    SelectObject(dc, dotB);
+    Ellipse(dc, pill.left + 14, pill.top + 9, pill.left + 24, pill.top + 19);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(pb);
+    DeleteObject(pp);
+    DeleteObject(dotB);
+    SelectObject(dc, fBold);
+    SetTextColor(dc, pc);
+    RECT tr = { pill.left + 28, pill.top, pill.right - 6, pill.bottom };
+    DrawTextW(dc, pt, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    // Đường kẻ dưới thanh tab
+    HPEN sp = CreatePen(PS_SOLID, 1, t.border);
+    HGDIOBJ oldPen = SelectObject(dc, sp);
+    MoveToEx(dc, 10, kTabTop + kTabBarH, nullptr);
+    LineTo(dc, client.right - 10, kTabTop + kTabBarH);
+    SelectObject(dc, oldPen);
+    DeleteObject(sp);
+
+    // Dải trạng thái dưới cùng
+    SelectObject(dc, fUI);
+    SetTextColor(dc, t.muted);
+    std::wstring st = L"Ctrl+Alt+F7 = tắt engine khẩn cấp    |    Quyền Admin: ";
+    st += g.admin ? L"có" : L"không (ghi config/priority sẽ bị chặn)";
+    TextOutW(dc, 12, client.bottom - kStatusH + 4, st.c_str(), (int)st.size());
+
+    SelectObject(dc, oldFont);
+    EndPaint(hwnd, &ps);
+}
+
+// Áp theme cho các control con dùng visual style (listbox/edit/combobox/checkbox) + thanh tiêu đề cửa sổ.
+static BOOL CALLBACK ThemeChildProc(HWND h, LPARAM) {
+    wchar_t cls[32] = {};
+    GetClassNameW(h, cls, 32);
+    if (lstrcmpiW(cls, L"ListBox") == 0) {
+        SetWindowTheme(h, g_dark ? L"DarkMode_Explorer" : nullptr, nullptr);
+    } else if (lstrcmpiW(cls, L"Edit") == 0 || lstrcmpiW(cls, L"ComboBox") == 0) {
+        SetWindowTheme(h, g_dark ? L"DarkMode_CFD" : nullptr, nullptr);
+    } else if (lstrcmpiW(cls, L"Button") == 0) {
+        LONG_PTR type = GetWindowLongPtrW(h, GWL_STYLE) & 0xF;
+        if (type == BS_CHECKBOX || type == BS_AUTOCHECKBOX) {
+            // Checkbox kiểu classic để chữ nhận màu từ WM_CTLCOLORSTATIC (theme mặc định luôn vẽ chữ đen)
+            if (g_dark) SetWindowTheme(h, L"", L""); else SetWindowTheme(h, nullptr, nullptr);
+        }
+    }
+    return TRUE;
+}
+
+static void ApplyTheme() {
+    if (!g.hMain) return;
+    BOOL dark = g_dark ? TRUE : FALSE;
+    DwmSetWindowAttribute(g.hMain, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    COLORREF cap = Th().bg, txtc = Th().text;
+    DwmSetWindowAttribute(g.hMain, DWMWA_CAPTION_COLOR, &cap, sizeof(cap));
+    DwmSetWindowAttribute(g.hMain, DWMWA_TEXT_COLOR, &txtc, sizeof(txtc));
+    EnumChildWindows(g.hMain, ThemeChildProc, 0);
+    if (g.themeToggle) SetWindowTextW(g.themeToggle, g_dark ? L"Chế độ sáng" : L"Chế độ tối");
+    RedrawWindow(g.hMain, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
 
 static HWND g_dlgHwnd = nullptr;
 static HWND g_dlgKeyEdit = nullptr;
@@ -884,6 +1234,14 @@ static LRESULT CALLBACK EditKeyDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             return 0;
         }
         break;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        return ThemeCtlColor(msg, (HDC)wParam, (HWND)lParam);
+    case WM_ERASEBKGND: {
+        RECT rc; GetClientRect(hwnd, &rc);
+        FillRect((HDC)wParam, &rc, BrBg());
+        return 1;
     }
     case WM_CLOSE:
         g_dlgResult = false;
@@ -1731,6 +2089,7 @@ static void OnMouseReset() {
 
 // ===================== Engine tab handlers =====================
 static std::wstring FormatFixed(double v, int decimals) {
+    if (decimals <= 0) return std::to_wstring((long long)std::llround(v));
     double mul = std::pow(10.0, decimals);
     long long scaled = (long long)std::llround(v * mul);
     bool neg = scaled < 0;
@@ -1778,24 +2137,192 @@ static void EngineSyncFromControls() {
     if (curDpi >= 100.0 && curDpi <= 32000.0) g_engine.curDpi = curDpi;
 }
 
-static void OnEngToggle() {
-    bool wantOn = SendMessageW(g.engEnable, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    if (wantOn) {
+static void UpdateEngineUi() {
+    int st = g_engine.enabled.load() ? 1 : (g_engine.tripped ? 2 : 0);
+    g.engState = st;
+    if (g.engEnable) SendMessageW(g.engEnable, BM_SETCHECK, st == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (g.engStatus) SetWindowTextW(g.engStatus, st == 1 ? L"ĐANG BẬT" : (st == 2 ? L"ĐÃ TỰ NGẮT" : L"TẮT"));
+    if (g.qsToggle) {
+        SetWindowTextW(g.qsToggle, st == 1 ? L"TẮT ENGINE" : L"BẬT ENGINE");
+        InvalidateRect(g.qsToggle, nullptr, TRUE);
+    }
+    if (g.qsStatus) {
+        SetWindowTextW(g.qsStatus,
+            st == 1 ? L"Đang BẬT: chuột đang đi qua bộ lọc của Mouse Forge." :
+            (st == 2 ? L"Đã TỰ NGẮT vì thấy chuột bất thường. Kiểm tra Cur DPI ở tab Engine rồi bật lại." :
+                       L"Đang TẮT: chuột chạy như Windows bình thường."));
+    }
+    if (g.hMain) {
+        RECT hr = { 0, 0, 900, kTabTop };
+        InvalidateRect(g.hMain, &hr, TRUE);
+    }
+}
+
+// Điểm duy nhất bật/tắt engine (nút Bắt đầu, checkbox tab Engine, phím tắt, bộ bảo vệ, thoát app).
+static void EngineSetEnabled(bool on, const std::wstring& why, bool trippedByGuard = false) {
+    if (on) {
+        if (g_engine.enabled.load()) { UpdateEngineUi(); return; }
         EngineSyncFromControls();
         if (MouseEngine_Register(g.hMain)) {
+            g_engine.tripped = false;
             g_engine.enabled = true;
-            SetWindowTextW(g.engStatus, L"● BẬT");
-            log_line(L"[Engine] đã bật Mouse Engine (raw input, RIDEV_NOLEGACY)");
+            SetTimer(g.hMain, kTimerFlush, 10, nullptr);
+            log_line(L"[Engine] đã BẬT. " + why);
         } else {
-            SendMessageW(g.engEnable, BM_SETCHECK, BST_UNCHECKED, 0);
             log_line(L"[Engine] KHÔNG bật được (RegisterRawInputDevices thất bại)");
         }
     } else {
         g_engine.enabled = false;
-        MouseEngine_Unregister(g.hMain);
-        SetWindowTextW(g.engStatus, L"● TẮT");
-        log_line(L"[Engine] đã tắt Mouse Engine, chuột trở lại mặc định Windows");
+        KillTimer(g.hMain, kTimerFlush);
+        if (g_engine.rawRegistered || g_engine.savedOs) MouseEngine_Unregister(g.hMain);
+        g_engine.tripped = trippedByGuard;
+        log_line(L"[Engine] đã TẮT. " + why);
     }
+    UpdateEngineUi();
+}
+
+static void OnEngToggle() {
+    bool wantOn = SendMessageW(g.engEnable, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    EngineSetEnabled(wantOn, L"(từ tab Engine)");
+}
+
+// Đặt vị trí các thanh trượt Engine từ giá trị thật (dùng llround để không bị lệch 1 nấc do sai số số thực)
+static void SetEngineSliders(double ema, int vel, double micro, double accel, double offset, double cap) {
+    SendMessageW(g.engEmaTrack,    TBM_SETPOS, TRUE, (LPARAM)std::llround(ema * 10.0));
+    SendMessageW(g.engVelTrack,    TBM_SETPOS, TRUE, (LPARAM)vel);
+    SendMessageW(g.engMicroTrack,  TBM_SETPOS, TRUE, (LPARAM)std::llround(micro * 10.0));
+    SendMessageW(g.engAccelTrack,  TBM_SETPOS, TRUE, (LPARAM)std::llround(accel * 100.0));
+    SendMessageW(g.engOffsetTrack, TBM_SETPOS, TRUE, (LPARAM)std::llround(offset * 10.0));
+    SendMessageW(g.engCapTrack,    TBM_SETPOS, TRUE, (LPARAM)std::llround(cap * 100.0));
+}
+
+// Kiểu chuột dựng sẵn cho tab "Bắt đầu" (mô tả bằng lời thường, không cần hiểu thuật ngữ)
+struct EnginePreset { const wchar_t* name; double ema; int vel; double micro; double accel; double offset; double cap; };
+static const EnginePreset kEnginePresets[4] = {
+    { L"Chính xác 1:1",        0.0, 4, 2.0, 0.00, 5.0, 1.00 },
+    { L"Mượt & ổn định",       3.0, 4, 2.0, 0.00, 5.0, 1.00 },
+    { L"Cân bằng (khuyên dùng)", 2.0, 4, 2.0, 0.03, 3.0, 1.50 },
+    { L"Xoay nhanh",           1.5, 3, 1.5, 0.06, 2.0, 2.00 },
+};
+
+static void OnQuickPreset(int idx) {
+    if (idx < 0 || idx > 4) return;
+    if (idx == 4) {
+        EngineSetEnabled(false, L"(về mặc định Windows)");
+        return;
+    }
+    const EnginePreset& p = kEnginePresets[idx];
+    SetEngineSliders(p.ema, p.vel, p.micro, p.accel, p.offset, p.cap);
+    EngineSyncFromControls();
+    log_line(std::wstring(L"[Bắt đầu] đã chọn kiểu \"") + p.name + L"\".");
+    if (!g_engine.enabled.load()) log_line(L"[Bắt đầu] bấm BẬT ENGINE để dùng kiểu này.");
+}
+
+// Đồng bộ toàn bộ UI Engine theo g_engine (dùng khi nạp cài đặt đã lưu lúc khởi động)
+static void SyncEngineUiFromState() {
+    double refD = g_engine.refDpi, curD = g_engine.curDpi;   // chụp trước: SetWindowText sẽ bắn EN_CHANGE và ghi đè g_engine
+    bool wd = g_engine.watchdogOn;
+    SetEngineSliders(g_engine.emaFastMs, g_engine.velWindow, g_engine.microThresh,
+                     g_engine.accel, g_engine.accelOffset, g_engine.accelCap);
+    SetWindowTextW(g.engRefDpi, std::to_wstring((long long)std::llround(refD)).c_str());
+    SetWindowTextW(g.engCurDpi, std::to_wstring((long long)std::llround(curD)).c_str());
+    g_engine.watchdogOn = wd;
+    if (g.testWatchdog) SendMessageW(g.testWatchdog, BM_SETCHECK, wd ? BST_CHECKED : BST_UNCHECKED, 0);
+    EngineSyncFromControls();
+}
+
+// ===================== Cài đặt lưu (theme + thông số engine) =====================
+static fs::path settings_path() {
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    return fs::path(exe).parent_path() / L"MouseForge.ini";
+}
+static double ClampD(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static void LoadSettings() {
+    std::ifstream f(settings_path());
+    if (!f.is_open()) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+        if (!v.empty() && v.back() == '\r') v.pop_back();
+        double d = 0;
+        try { d = std::stod(v); } catch (...) { continue; }
+        if (k == "dark") g_dark = d != 0.0;
+        else if (k == "ema") g_engine.emaFastMs = ClampD(d, 0.0, 10.0);
+        else if (k == "vel") g_engine.velWindow = (int)ClampD(d, 1.0, 10.0);
+        else if (k == "micro") g_engine.microThresh = ClampD(d, 0.0, 10.0);
+        else if (k == "accel") g_engine.accel = ClampD(d, 0.0, 0.5);
+        else if (k == "offset") g_engine.accelOffset = ClampD(d, 0.0, 20.0);
+        else if (k == "cap") g_engine.accelCap = ClampD(d, 1.0, 3.0);
+        else if (k == "ref") g_engine.refDpi = ClampD(d, 100.0, 32000.0);
+        else if (k == "cur") g_engine.curDpi = ClampD(d, 100.0, 32000.0);
+        else if (k == "watchdog") g_engine.watchdogOn = d != 0.0;
+    }
+}
+
+static void SaveSettings() {
+    std::ofstream f(settings_path(), std::ios::trunc);
+    if (!f.is_open()) return;
+    f << "dark=" << (g_dark ? 1 : 0) << "\n";
+    f << "ema=" << g_engine.emaFastMs << "\n";
+    f << "vel=" << g_engine.velWindow << "\n";
+    f << "micro=" << g_engine.microThresh << "\n";
+    f << "accel=" << g_engine.accel << "\n";
+    f << "offset=" << g_engine.accelOffset << "\n";
+    f << "cap=" << g_engine.accelCap << "\n";
+    f << "ref=" << g_engine.refDpi << "\n";
+    f << "cur=" << g_engine.curDpi << "\n";
+    f << "watchdog=" << (g_engine.watchdogOn ? 1 : 0) << "\n";
+}
+
+// ===================== Tab Test: bảng đo trực tiếp =====================
+static double g_lastStatMs = -1.0;
+static std::wstring g_lastTestTxt[7];
+static void SetTestText(int i, HWND h, const std::wstring& t) {
+    if (!h) return;
+    if (g_lastTestTxt[i] == t) return;   // chỉ cập nhật khi đổi, tránh nhấp nháy
+    g_lastTestTxt[i] = t;
+    SetWindowTextW(h, t.c_str());
+}
+
+static void UpdateTestTab() {
+    if (!g.testVerdict) return;
+    double now = NowMs();
+    double win = (g_lastStatMs < 0.0) ? 250.0 : now - g_lastStatMs;
+    if (win < 50.0) win = 50.0;
+    g_lastStatMs = now;
+
+    double inRate = g_engine.stIn * 1000.0 / win;
+    double outRate = g_engine.stOut * 1000.0 / win;
+    double evRate = (double)g_engine.stEvents * 1000.0 / win;
+    double ratio = inRate > 1.0 ? outRate / inRate : 0.0;
+    g_engine.stIn = g_engine.stOut = 0.0;
+    g_engine.stEvents = 0;
+
+    bool on = g_engine.enabled.load();
+    SetTestText(0, g.testVals[0], FormatFixed(inRate, 0) + L" counts/giây");
+    SetTestText(1, g.testVals[1], FormatFixed(outRate, 0) + L" counts/giây");
+    SetTestText(2, g.testVals[2], inRate > 1.0 ? FormatFixed(ratio, 2) + L"x" : std::wstring(L"—"));
+    SetTestText(3, g.testVals[3], FormatFixed(g_engine.stMult, 2) + L"x");
+    SetTestText(4, g.testVals[4], FormatFixed(g_engine.stVel, 1) + L" counts/ms");
+    SetTestText(5, g.testVals[5], FormatFixed(evRate, 0) + L" Hz");
+
+    int level = 3;
+    std::wstring vt;
+    if (g.engState == 2) { level = 2; vt = L"ĐÃ TỰ NGẮT: phát hiện chuột chạy bất thường."; }
+    else if (!on) { level = 3; vt = L"Engine đang tắt. Bật ở tab \"Bắt đầu\" để đo."; }
+    else if (inRate < 20.0) { level = 3; vt = L"Hãy di chuột để bắt đầu đo..."; }
+    else if (ratio > g_engine.accelCap + 1.0) { level = 2; vt = L"NGUY HIỂM: chuột ra nhanh hơn chuột thật nhiều lần. Hãy tắt engine!"; }
+    else if (ratio > 1.6) { level = 1; vt = L"Đang tăng tốc mạnh (bình thường nếu bạn vung nhanh)."; }
+    else { level = 0; vt = L"BÌNH THƯỜNG: chuột ra gần bằng chuột vào."; }
+    if (level != g.verdictLevel) {
+        g.verdictLevel = level;
+        InvalidateRect(g.testVerdict, nullptr, TRUE);
+    }
+    SetTestText(6, g.testVerdict, vt);
 }
 
 static void OnEngReset() {
@@ -1816,75 +2343,71 @@ static void ShowTabPage(int idx) {
     g.curTab = idx;
     for (int i = 0; i < AppGlobals::TAB_COUNT; ++i) {
         int cmd = (i == idx) ? SW_SHOW : SW_HIDE;
-        for (HWND h : g.tabControls[i]) {
+        for (HWND h : g.tabControls[kTabContentIdx[i]]) {
             if (h) ShowWindow(h, cmd);
         }
+        HWND tb = GetDlgItem(g.hMain, IDC_TABBTN_BASE + i);
+        if (tb) InvalidateRect(tb, nullptr, TRUE);
     }
 }
 
 // ===================== UI construction =====================
-// Duyệt toàn bộ control con, thêm style BS_FLAT cho mọi nút BUTTON để giao diện phẳng/hiện đại hơn.
-static BOOL CALLBACK FlattenButtonsProc(HWND hwnd, LPARAM) {
-    wchar_t cls[64];
-    GetClassNameW(hwnd, cls, 64);
-    if (lstrcmpiW(cls, L"Button") == 0) {
-        LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        // Chỉ thêm BS_FLAT cho pushbutton thường, không đụng tới checkbox (giữ khung ô vuông rõ ràng)
-        LONG_PTR btnType = style & 0xF; // BS_* nằm ở 4 bit thấp
-        if (btnType == BS_PUSHBUTTON || btnType == BS_DEFPUSHBUTTON) {
-            SetWindowLongPtrW(hwnd, GWL_STYLE, style | BS_FLAT);
-        }
-    }
-    return TRUE;
-}
-
 static void CreateMainControls(HWND hwnd) {
     g.hFontUI = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
     g.hFontMono = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_MODERN, L"Consolas");
 
-    // ---- Header (banner màu + tên app trên cùng) ----
-    // Panel màu nền phải tạo TRƯỚC (z-order dưới) để chữ đè lên trên
-    g.hHeaderPanel = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-        0, 0, 900, kHeaderTop + kHeaderH + 8, hwnd, nullptr, g.hInst, nullptr);
-
-    g.hFontTitle = CreateFontW(-22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    g.hFontBold = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    g.hHeaderTitle = CreateWindowExW(0, L"STATIC", L"Mouse Forge", WS_CHILD | WS_VISIBLE | SS_LEFT,
-        16, kHeaderTop, 400, kHeaderH, hwnd, nullptr, g.hInst, nullptr);
-    SendMessageW(g.hHeaderTitle, WM_SETFONT, (WPARAM)g.hFontTitle, TRUE);
-    g.hHeaderSub = CreateWindowExW(0, L"STATIC", L"BlueStacks Tuning Panel  •  v2", WS_CHILD | WS_VISIBLE | SS_RIGHT,
-        480, kHeaderTop + 12, 384, 20, hwnd, nullptr, g.hInst, nullptr);
-    SendMessageW(g.hHeaderSub, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
-    CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
-        10, kHeaderTop + kHeaderH + 2, 860, 2, hwnd, nullptr, g.hInst, nullptr);
+    g.hFontTitle = CreateFontW(-26, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    g_engineNotifyWnd = hwnd;
 
-    g.hTab = CreateWindowExW(0, WC_TABCONTROLW, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-        10, kTabTop, 860, 500, hwnd, (HMENU)(INT_PTR)IDC_TAB, g.hInst, nullptr);
-    SendMessageW(g.hTab, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
+    // ---- Header: tên app + chip trạng thái được vẽ trong WM_PAINT; ở đây chỉ có nút đổi giao diện ----
+    g.themeToggle = CreateWindowExW(0, L"BUTTON", g_dark ? L"Chế độ sáng" : L"Chế độ tối",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        774, kHeaderTop + 10, 96, 28, hwnd, (HMENU)(INT_PTR)IDC_THEME_TOGGLE, g.hInst, nullptr);
 
-    const wchar_t* tabNames[AppGlobals::TAB_COUNT] = { L"Config", L"ADB", L"Tối ưu", L"Root", L"Thông tin", L"Presets", L"Chuột", L"Engine" };
-    for (int i = 0; i < AppGlobals::TAB_COUNT; ++i) {
-        TCITEMW tie{};
-        tie.mask = TCIF_TEXT;
-        tie.pszText = (LPWSTR)tabNames[i];
-        TabCtrl_InsertItem(g.hTab, i, &tie);
+    // ---- Thanh tab tự vẽ (nút BS_OWNERDRAW) ----
+    {
+        HDC hdc = GetDC(hwnd);
+        HFONT oldF = (HFONT)SelectObject(hdc, g.hFontBold);
+        int widths[AppGlobals::TAB_COUNT];
+        int total = 0;
+        for (int i = 0; i < AppGlobals::TAB_COUNT; ++i) {
+            SIZE sz{};
+            GetTextExtentPoint32W(hdc, kTabNames[i], lstrlenW(kTabNames[i]), &sz);
+            widths[i] = sz.cx + 26;
+            total += widths[i];
+        }
+        SelectObject(hdc, oldF);
+        ReleaseDC(hwnd, hdc);
+        if (total > 860) {
+            double f = 860.0 / (double)total;
+            for (int i = 0; i < AppGlobals::TAB_COUNT; ++i) widths[i] = (int)(widths[i] * f);
+        }
+        int x = 10;
+        for (int i = 0; i < AppGlobals::TAB_COUNT; ++i) {
+            CreateWindowExW(0, L"BUTTON", kTabNames[i], WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                x, kTabTop, widths[i], kTabBarH, hwnd, (HMENU)(INT_PTR)(IDC_TABBTN_BASE + i), g.hInst, nullptr);
+            x += widths[i];
+        }
     }
 
-    int px = 20, py = kTabTop + 30;
+    int px = 20, py = kContentTop;
 
     // ---- Tab 1: Config ----
     HWND cfgLbl1 = CreateWindowExW(0, L"STATIC", L"File config:", WS_CHILD, px, py, 100, 20, hwnd, nullptr, g.hInst, nullptr);
     g.cfgCombo = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
         px + 100, py - 2, 590, 200, hwnd, (HMENU)(INT_PTR)IDC_CFG_COMBO, g.hInst, nullptr);
-    g.cfgRescan = CreateWindowExW(0, L"BUTTON", L"Quét lại", WS_CHILD,
+    g.cfgRescan = CreateWindowExW(0, L"BUTTON", L"Quét lại", WS_CHILD | BS_OWNERDRAW,
         px + 700, py - 3, 110, 26, hwnd, (HMENU)(INT_PTR)IDC_CFG_RESCAN, g.hInst, nullptr);
-    g.cfgEditKey = CreateWindowExW(0, L"BUTTON", L"Sửa key", WS_CHILD,
+    g.cfgEditKey = CreateWindowExW(0, L"BUTTON", L"Sửa key", WS_CHILD | BS_OWNERDRAW,
         px, py + 34, 110, 28, hwnd, (HMENU)(INT_PTR)IDC_CFG_EDITKEY, g.hInst, nullptr);
-    g.cfgBackup = CreateWindowExW(0, L"BUTTON", L"Backup", WS_CHILD,
+    g.cfgBackup = CreateWindowExW(0, L"BUTTON", L"Backup", WS_CHILD | BS_OWNERDRAW,
         px + 120, py + 34, 110, 28, hwnd, (HMENU)(INT_PTR)IDC_CFG_BACKUP, g.hInst, nullptr);
-    g.cfgRestore = CreateWindowExW(0, L"BUTTON", L"Restore", WS_CHILD,
+    g.cfgRestore = CreateWindowExW(0, L"BUTTON", L"Restore", WS_CHILD | BS_OWNERDRAW,
         px + 240, py + 34, 110, 28, hwnd, (HMENU)(INT_PTR)IDC_CFG_RESTORE, g.hInst, nullptr);
     g.cfgList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
         WS_CHILD | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY | LBS_DISABLENOSCROLL,
@@ -1902,7 +2425,7 @@ static void CreateMainControls(HWND hwnd) {
         px, py + 36, 100, 20, hwnd, (HMENU)(INT_PTR)IDC_ADB_SERIAL_LBL, g.hInst, nullptr);
     g.adbSerial = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"127.0.0.1:5555", WS_CHILD | WS_BORDER,
         px + 100, py + 34, 200, 24, hwnd, (HMENU)(INT_PTR)IDC_ADB_SERIAL, g.hInst, nullptr);
-    g.adbConnect = CreateWindowExW(0, L"BUTTON", L"Dò && nạp", WS_CHILD,
+    g.adbConnect = CreateWindowExW(0, L"BUTTON", L"Dò && nạp", WS_CHILD | BS_OWNERDRAW,
         px + 320, py + 33, 120, 28, hwnd, (HMENU)(INT_PTR)IDC_ADB_CONNECT, g.hInst, nullptr);
     HWND adbLbl2 = CreateWindowExW(0, L"STATIC", L"Thông tin thiết bị:", WS_CHILD, px, py + 72, 200, 20, hwnd, nullptr, g.hInst, nullptr);
     HWND adbLbl3 = CreateWindowExW(0, L"STATIC", L"Key Android:", WS_CHILD, px + 410, py + 72, 200, 20, hwnd, nullptr, g.hInst, nullptr);
@@ -1926,7 +2449,7 @@ static void CreateMainControls(HWND hwnd) {
     g.optHaptic = CreateWindowExW(0, L"BUTTON", L"tắt haptic feedback", WS_CHILD | BS_AUTOCHECKBOX, px + 280, oy + 56, 280, 22, hwnd, (HMENU)(INT_PTR)IDC_OPT_HAPTIC, g.hInst, nullptr);
     g.optTimeout = CreateWindowExW(0, L"BUTTON", L"không tự tắt màn hình", WS_CHILD | BS_AUTOCHECKBOX, px + 280, oy + 84, 280, 22, hwnd, (HMENU)(INT_PTR)IDC_OPT_TIMEOUT, g.hInst, nullptr);
     g.optRotation = CreateWindowExW(0, L"BUTTON", L"khoá xoay màn hình tự động", WS_CHILD | BS_AUTOCHECKBOX, px + 280, oy + 112, 280, 22, hwnd, (HMENU)(INT_PTR)IDC_OPT_ROTATION, g.hInst, nullptr);
-    g.optScan = CreateWindowExW(0, L"BUTTON", L"Quét prop + tối ưu", WS_CHILD, px, oy + 150, 220, 30, hwnd, (HMENU)(INT_PTR)IDC_OPT_SCAN, g.hInst, nullptr);
+    g.optScan = CreateWindowExW(0, L"BUTTON", L"Quét prop + tối ưu", WS_CHILD | BS_OWNERDRAW, px, oy + 150, 220, 30, hwnd, (HMENU)(INT_PTR)IDC_OPT_SCAN, g.hInst, nullptr);
     g.optList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
         WS_CHILD | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY | LBS_DISABLENOSCROLL,
         px, oy + 190, 800, 250, hwnd, (HMENU)(INT_PTR)IDC_OPT_LIST, g.hInst, nullptr);
@@ -1939,10 +2462,10 @@ static void CreateMainControls(HWND hwnd) {
     SendMessageW(g.optList, WM_SETFONT, (WPARAM)g.hFontMono, TRUE);
 
     // ---- Tab 4: Root ----
-    g.rootCheck = CreateWindowExW(0, L"BUTTON", L"Kiểm tra root", WS_CHILD, px, py, 150, 30, hwnd, (HMENU)(INT_PTR)IDC_ROOT_CHECK, g.hInst, nullptr);
-    g.rootOn = CreateWindowExW(0, L"BUTTON", L"Bật root qua config", WS_CHILD, px + 160, py, 180, 30, hwnd, (HMENU)(INT_PTR)IDC_ROOT_ON, g.hInst, nullptr);
-    g.rootOff = CreateWindowExW(0, L"BUTTON", L"Tắt root qua config", WS_CHILD, px + 350, py, 180, 30, hwnd, (HMENU)(INT_PTR)IDC_ROOT_OFF, g.hInst, nullptr);
-    g.rootVerify = CreateWindowExW(0, L"BUTTON", L"Xác minh root", WS_CHILD, px + 540, py, 150, 30, hwnd, (HMENU)(INT_PTR)IDC_ROOT_VERIFY, g.hInst, nullptr);
+    g.rootCheck = CreateWindowExW(0, L"BUTTON", L"Kiểm tra root", WS_CHILD | BS_OWNERDRAW, px, py, 150, 30, hwnd, (HMENU)(INT_PTR)IDC_ROOT_CHECK, g.hInst, nullptr);
+    g.rootOn = CreateWindowExW(0, L"BUTTON", L"Bật root qua config", WS_CHILD | BS_OWNERDRAW, px + 160, py, 180, 30, hwnd, (HMENU)(INT_PTR)IDC_ROOT_ON, g.hInst, nullptr);
+    g.rootOff = CreateWindowExW(0, L"BUTTON", L"Tắt root qua config", WS_CHILD | BS_OWNERDRAW, px + 350, py, 180, 30, hwnd, (HMENU)(INT_PTR)IDC_ROOT_OFF, g.hInst, nullptr);
+    g.rootVerify = CreateWindowExW(0, L"BUTTON", L"Xác minh root", WS_CHILD | BS_OWNERDRAW, px + 540, py, 150, 30, hwnd, (HMENU)(INT_PTR)IDC_ROOT_VERIFY, g.hInst, nullptr);
     g.rootList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
         WS_CHILD | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY | LBS_DISABLENOSCROLL,
         px, py + 46, 800, 400, hwnd, (HMENU)(INT_PTR)IDC_ROOT_LIST, g.hInst, nullptr);
@@ -1952,9 +2475,9 @@ static void CreateMainControls(HWND hwnd) {
     SendMessageW(g.rootList, WM_SETFONT, (WPARAM)g.hFontMono, TRUE);
 
     // ---- Tab 5: Info ----
-    g.infoLoad = CreateWindowExW(0, L"BUTTON", L"Nạp thông tin", WS_CHILD, px, py, 150, 30, hwnd, (HMENU)(INT_PTR)IDC_INFO_LOAD, g.hInst, nullptr);
-    g.infoPriority = CreateWindowExW(0, L"BUTTON", L"Priority HIGH cho BS", WS_CHILD, px + 160, py, 190, 30, hwnd, (HMENU)(INT_PTR)IDC_INFO_PRIORITY, g.hInst, nullptr);
-    g.infoClearLog = CreateWindowExW(0, L"BUTTON", L"Xoá log", WS_CHILD, px + 360, py, 120, 30, hwnd, (HMENU)(INT_PTR)IDC_INFO_CLEARLOG, g.hInst, nullptr);
+    g.infoLoad = CreateWindowExW(0, L"BUTTON", L"Nạp thông tin", WS_CHILD | BS_OWNERDRAW, px, py, 150, 30, hwnd, (HMENU)(INT_PTR)IDC_INFO_LOAD, g.hInst, nullptr);
+    g.infoPriority = CreateWindowExW(0, L"BUTTON", L"Priority HIGH cho BS", WS_CHILD | BS_OWNERDRAW, px + 160, py, 190, 30, hwnd, (HMENU)(INT_PTR)IDC_INFO_PRIORITY, g.hInst, nullptr);
+    g.infoClearLog = CreateWindowExW(0, L"BUTTON", L"Xoá log", WS_CHILD | BS_OWNERDRAW, px + 360, py, 120, 30, hwnd, (HMENU)(INT_PTR)IDC_INFO_CLEARLOG, g.hInst, nullptr);
     g.infoText = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
         px, py + 46, 800, 400, hwnd, (HMENU)(INT_PTR)IDC_INFO_TEXT, g.hInst, nullptr);
@@ -1966,14 +2489,14 @@ static void CreateMainControls(HWND hwnd) {
     HWND presetLbl1 = CreateWindowExW(0, L"STATIC", L"Preset đã lưu:", WS_CHILD, px, py, 110, 20, hwnd, nullptr, g.hInst, nullptr);
     g.presetCombo = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
         px + 110, py - 2, 300, 200, hwnd, (HMENU)(INT_PTR)IDC_PRESET_COMBO, g.hInst, nullptr);
-    g.presetLoad = CreateWindowExW(0, L"BUTTON", L"Nạp", WS_CHILD, px + 420, py - 3, 90, 26, hwnd, (HMENU)(INT_PTR)IDC_PRESET_LOAD, g.hInst, nullptr);
-    g.presetDelete = CreateWindowExW(0, L"BUTTON", L"Xoá", WS_CHILD, px + 520, py - 3, 90, 26, hwnd, (HMENU)(INT_PTR)IDC_PRESET_DELETE, g.hInst, nullptr);
-    g.presetRefresh = CreateWindowExW(0, L"BUTTON", L"Quét lại", WS_CHILD, px + 620, py - 3, 90, 26, hwnd, (HMENU)(INT_PTR)IDC_PRESET_REFRESH, g.hInst, nullptr);
+    g.presetLoad = CreateWindowExW(0, L"BUTTON", L"Nạp", WS_CHILD | BS_OWNERDRAW, px + 420, py - 3, 90, 26, hwnd, (HMENU)(INT_PTR)IDC_PRESET_LOAD, g.hInst, nullptr);
+    g.presetDelete = CreateWindowExW(0, L"BUTTON", L"Xoá", WS_CHILD | BS_OWNERDRAW, px + 520, py - 3, 90, 26, hwnd, (HMENU)(INT_PTR)IDC_PRESET_DELETE, g.hInst, nullptr);
+    g.presetRefresh = CreateWindowExW(0, L"BUTTON", L"Quét lại", WS_CHILD | BS_OWNERDRAW, px + 620, py - 3, 90, 26, hwnd, (HMENU)(INT_PTR)IDC_PRESET_REFRESH, g.hInst, nullptr);
 
     HWND presetLbl2 = CreateWindowExW(0, L"STATIC", L"Tên preset mới:", WS_CHILD, px, py + 40, 110, 20, hwnd, nullptr, g.hInst, nullptr);
     g.presetName = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_BORDER,
         px + 110, py + 38, 300, 24, hwnd, (HMENU)(INT_PTR)IDC_PRESET_NAME, g.hInst, nullptr);
-    g.presetSave = CreateWindowExW(0, L"BUTTON", L"Lưu lựa chọn hiện tại ở tab Tối ưu thành preset", WS_CHILD,
+    g.presetSave = CreateWindowExW(0, L"BUTTON", L"Lưu lựa chọn hiện tại ở tab Tối ưu thành preset", WS_CHILD | BS_OWNERDRAW,
         px + 420, py + 37, 380, 26, hwnd, (HMENU)(INT_PTR)IDC_PRESET_SAVE, g.hInst, nullptr);
 
     g.presetList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
@@ -2015,11 +2538,11 @@ static void CreateMainControls(HWND hwnd) {
         WS_CHILD | BS_AUTOCHECKBOX, px, py + 160, 520, 22, hwnd, (HMENU)(INT_PTR)IDC_MOUSE_PRECISION, g.hInst, nullptr);
     SendMessageW(g.mousePrecision, BM_SETCHECK, BST_CHECKED, 0);
 
-    g.mouseRefresh = CreateWindowExW(0, L"BUTTON", L"Đọc giá trị Windows hiện tại", WS_CHILD,
+    g.mouseRefresh = CreateWindowExW(0, L"BUTTON", L"Đọc giá trị Windows hiện tại", WS_CHILD | BS_OWNERDRAW,
         px, py + 200, 220, 30, hwnd, (HMENU)(INT_PTR)IDC_MOUSE_REFRESH, g.hInst, nullptr);
-    g.mouseApply = CreateWindowExW(0, L"BUTTON", L"Áp dụng vào Windows", WS_CHILD,
+    g.mouseApply = CreateWindowExW(0, L"BUTTON", L"Áp dụng vào Windows", WS_CHILD | BS_OWNERDRAW,
         px + 230, py + 200, 220, 30, hwnd, (HMENU)(INT_PTR)IDC_MOUSE_APPLY, g.hInst, nullptr);
-    g.mouseReset = CreateWindowExW(0, L"BUTTON", L"Khôi phục mặc định Windows", WS_CHILD,
+    g.mouseReset = CreateWindowExW(0, L"BUTTON", L"Khôi phục mặc định Windows", WS_CHILD | BS_OWNERDRAW,
         px + 460, py + 200, 220, 30, hwnd, (HMENU)(INT_PTR)IDC_MOUSE_RESET, g.hInst, nullptr);
 
     HWND mNote = CreateWindowExW(0, L"STATIC",
@@ -2035,7 +2558,7 @@ static void CreateMainControls(HWND hwnd) {
     // ---- Tab 8: Engine (EMA smoothing + custom acceleration curve trên raw input) ----
     g.engEnable = CreateWindowExW(0, L"BUTTON", L"Bật Mouse Engine (EMA smoothing + accel curve tùy chỉnh)",
         WS_CHILD | BS_AUTOCHECKBOX, px, py, 560, 22, hwnd, (HMENU)(INT_PTR)IDC_ENG_ENABLE, g.hInst, nullptr);
-    g.engStatus = CreateWindowExW(0, L"STATIC", L"● TẮT", WS_CHILD, px + 570, py + 2, 100, 20, hwnd, nullptr, g.hInst, nullptr);
+    g.engStatus = CreateWindowExW(0, L"STATIC", L"TẮT", WS_CHILD, px + 570, py + 2, 100, 20, hwnd, nullptr, g.hInst, nullptr);
 
     HWND eLbl1 = CreateWindowExW(0, L"STATIC", L"EMA Fast (0.0–10.0 ms):", WS_CHILD, px, py + 36, 220, 20, hwnd, nullptr, g.hInst, nullptr);
     g.engEmaTrack = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | TBS_AUTOTICKS | TBS_HORZ,
@@ -2086,7 +2609,7 @@ static void CreateMainControls(HWND hwnd) {
     g.engCurDpi = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"800", WS_CHILD | WS_BORDER | ES_NUMBER,
         px + 244, py + 229, 80, 24, hwnd, (HMENU)(INT_PTR)IDC_ENG_CURDPI, g.hInst, nullptr);
 
-    g.engReset = CreateWindowExW(0, L"BUTTON", L"Khôi phục mặc định + Áp dụng", WS_CHILD,
+    g.engReset = CreateWindowExW(0, L"BUTTON", L"Khôi phục mặc định + Áp dụng", WS_CHILD | BS_OWNERDRAW,
         px + 400, py + 228, 260, 28, hwnd, (HMENU)(INT_PTR)IDC_ENG_RESET, g.hInst, nullptr);
 
     HWND eNote = CreateWindowExW(0, L"STATIC",
@@ -2103,19 +2626,136 @@ static void CreateMainControls(HWND hwnd) {
                           eLbl7, g.engRefDpi, eLbl8, g.engCurDpi, g.engReset, eNote };
     for (HWND h : g.tabControls[7]) SendMessageW(h, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
 
+    auto mkStatic = [&](const wchar_t* text, int x, int y, int w, int h) -> HWND {
+        return CreateWindowExW(0, L"STATIC", text, WS_CHILD | SS_LEFT, x, y, w, h, hwnd, nullptr, g.hInst, nullptr);
+    };
+
+    // ---- Tab 9: Bắt đầu (dễ dùng nhất: chọn kiểu chuột -> bật) ----
+    HWND qsHead = mkStatic(L"Bắt đầu nhanh", px, py, 500, 26);
+    g.accentLabels.push_back(qsHead);
+    HWND qsDesc = mkStatic(
+        L"Bước 1: chọn kiểu chuột bên dưới.     Bước 2: bấm BẬT ENGINE.\r\n"
+        L"Thấy chuột lạ? Bấm TẮT ENGINE hoặc nhấn Ctrl+Alt+F7 để trả chuột về bình thường ngay.",
+        px, py + 30, 800, 42);
+    g.mutedLabels.push_back(qsDesc);
+    g.qsToggle = CreateWindowExW(0, L"BUTTON", L"BẬT ENGINE", WS_CHILD | BS_OWNERDRAW,
+        px, py + 80, 250, 48, hwnd, (HMENU)(INT_PTR)IDC_QS_TOGGLE, g.hInst, nullptr);
+    g.qsStatus = mkStatic(L"Đang TẮT: chuột chạy như Windows bình thường.", px + 270, py + 94, 530, 24);
+    HWND qsPick = mkStatic(L"Chọn kiểu chuột:", px, py + 148, 400, 24);
+    g.accentLabels.push_back(qsPick);
+
+    const wchar_t* presetText[5] = {
+        L"Chính xác 1:1\nKhông gia tốc, không làm mượt. Hợp ngắm tĩnh.",
+        L"Mượt & ổn định\nGiảm rung tay, di chuyển êm hơn.",
+        L"Cân bằng (khuyên dùng)\nMượt nhẹ + tăng tốc nhẹ khi vung nhanh.",
+        L"Xoay nhanh\nVung tay ngắn mà xoay xa hơn.",
+        L"Về mặc định Windows\nTắt engine, trả chuột về như ban đầu.",
+    };
+    HWND presetBtns[5];
+    for (int i = 0; i < 5; ++i) {
+        presetBtns[i] = CreateWindowExW(0, L"BUTTON", presetText[i], WS_CHILD | BS_OWNERDRAW,
+            px + (i % 2) * 410, py + 178 + (i / 2) * 74, 390, 64, hwnd, (HMENU)(INT_PTR)(IDC_QS_P1 + i), g.hInst, nullptr);
+    }
+    HWND qsTip = mkStatic(
+        L"Muốn tinh chỉnh sâu? Vào tab \"Engine\" và kéo các thanh trượt.\r\n"
+        L"Muốn biết chuột đang nhanh/chậm bao nhiêu? Xem tab \"Test\". Không hiểu một thông số? Xem tab \"Hướng dẫn\".",
+        px, py + 336, 800, 44);
+    g.mutedLabels.push_back(qsTip);
+
+    g.tabControls[8] = { qsHead, qsDesc, g.qsToggle, g.qsStatus, qsPick,
+                          presetBtns[0], presetBtns[1], presetBtns[2], presetBtns[3], presetBtns[4], qsTip };
+    for (HWND h : g.tabControls[8]) SendMessageW(h, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
+    SendMessageW(qsHead, WM_SETFONT, (WPARAM)g.hFontBold, TRUE);
+    SendMessageW(qsPick, WM_SETFONT, (WPARAM)g.hFontBold, TRUE);
+    SendMessageW(g.qsStatus, WM_SETFONT, (WPARAM)g.hFontBold, TRUE);
+
+    // ---- Tab 10: Test (bảng đo trực tiếp) ----
+    HWND tsHead = mkStatic(L"Đo chuột trực tiếp", px, py, 500, 26);
+    g.accentLabels.push_back(tsHead);
+    HWND tsDesc = mkStatic(
+        L"Bật engine rồi di chuột. Các số dưới đây cập nhật 4 lần/giây để bạn thấy engine có làm chuột nhanh hoặc chậm bất thường không.",
+        px, py + 30, 800, 42);
+    g.mutedLabels.push_back(tsDesc);
+    const wchar_t* testLabels[6] = {
+        L"Chuột thật (vào):", L"Sau engine (ra):", L"Tỉ lệ ra / vào:",
+        L"Hệ số gia tốc:", L"Tốc độ tay hiện tại:", L"Tần số báo cáo:" };
+    HWND tsLbl[6];
+    for (int i = 0; i < 6; ++i) {
+        tsLbl[i] = mkStatic(testLabels[i], px, py + 84 + i * 30, 220, 22);
+        g.testVals[i] = mkStatic(L"—", px + 230, py + 84 + i * 30, 300, 22);
+    }
+    g.testVerdict = mkStatic(L"Engine đang tắt. Bật ở tab \"Bắt đầu\" để đo.", px, py + 84 + 6 * 30 + 10, 800, 26);
+    g.testWatchdog = CreateWindowExW(0, L"BUTTON", L"Tự ngắt engine khi phát hiện chuột chạy bất thường (khuyên bật)",
+        WS_CHILD | BS_AUTOCHECKBOX, px, py + 84 + 6 * 30 + 50, 660, 24, hwnd, (HMENU)(INT_PTR)IDC_TEST_WATCHDOG, g.hInst, nullptr);
+    SendMessageW(g.testWatchdog, BM_SETCHECK, BST_CHECKED, 0);
+    g.testReset = CreateWindowExW(0, L"BUTTON", L"Đặt lại số liệu", WS_CHILD | BS_OWNERDRAW,
+        px, py + 84 + 6 * 30 + 88, 200, 32, hwnd, (HMENU)(INT_PTR)IDC_TEST_RESET, g.hInst, nullptr);
+    g.testClickPad = CreateWindowExW(0, L"BUTTON", L"Bấm thử vào đây\nSố click: 0", WS_CHILD | BS_OWNERDRAW,
+        px + 570, py + 84, 230, 130, hwnd, (HMENU)(INT_PTR)IDC_TEST_CLICKPAD, g.hInst, nullptr);
+    HWND tsNote = mkStatic(
+        L"Cách đọc: \"Tỉ lệ ra / vào\" quanh 1.00x–1.50x là bình thường. Nếu lên trên 3x, hoặc con trỏ tự trôi khi bạn không chạm chuột, "
+        L"engine sẽ tự ngắt để bảo vệ bạn.\r\n"
+        L"Nút bên phải để thử click: nếu số click tăng khi bạn bấm thì chuột trái vẫn hoạt động bình thường lúc engine đang bật.",
+        px, py + 84 + 6 * 30 + 134, 800, 64);
+    g.mutedLabels.push_back(tsNote);
+
+    g.tabControls[9] = { tsHead, tsDesc, tsLbl[0], g.testVals[0], tsLbl[1], g.testVals[1], tsLbl[2], g.testVals[2],
+                          tsLbl[3], g.testVals[3], tsLbl[4], g.testVals[4], tsLbl[5], g.testVals[5],
+                          g.testVerdict, g.testWatchdog, g.testReset, g.testClickPad, tsNote };
+    for (HWND h : g.tabControls[9]) SendMessageW(h, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
+    SendMessageW(tsHead, WM_SETFONT, (WPARAM)g.hFontBold, TRUE);
+    SendMessageW(g.testVerdict, WM_SETFONT, (WPARAM)g.hFontBold, TRUE);
+
+    // ---- Tab 11: Hướng dẫn ----
+    g.guideText = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT",
+        L"HƯỚNG DẪN NHANH\r\n"
+        L"\r\n"
+        L"1) Tab \"Bắt đầu\" — nên dùng đầu tiên\r\n"
+        L"   • Chọn 1 trong 4 kiểu chuột, rồi bấm BẬT ENGINE.\r\n"
+        L"   • Chuột lạ / quá nhanh / không click được? Bấm TẮT ENGINE hoặc nhấn Ctrl+Alt+F7.\r\n"
+        L"   • \"Về mặc định Windows\" = tắt hết, trả chuột về như ban đầu.\r\n"
+        L"\r\n"
+        L"2) Tab \"Engine\" — chỉnh chi tiết (áp dụng ngay khi kéo thanh trượt)\r\n"
+        L"   • EMA Fast (ms): độ làm mượt. Càng cao càng êm nhưng hơi trễ tay. 0 = tắt làm mượt.\r\n"
+        L"   • Velocity Window: số mẫu dùng để đo tốc độ tay. Cao = gia tốc ổn định hơn nhưng phản ứng chậm hơn.\r\n"
+        L"   • Micro Threshold: chuyển động nhỏ hơn mức này đi thẳng 1:1 (giữ chính xác khi ngắm tĩnh).\r\n"
+        L"   • Acceleration: chuột nhanh thêm bao nhiêu khi vung nhanh. 0 = không gia tốc.\r\n"
+        L"   • Accel Offset: tốc độ tay tối thiểu để gia tốc bắt đầu. Đặt thấp = gia tốc kích hoạt sớm.\r\n"
+        L"   • Accel Cap: mức nhân tối đa. 1.50 nghĩa là nhanh nhất gấp 1.5 lần bình thường.\r\n"
+        L"   • Cur DPI: DPI thật của chuột bạn (xem trên chuột hoặc phần mềm của hãng).\r\n"
+        L"     Ref DPI: DPI \"chuẩn\" bạn muốn cảm giác giống. Không rõ thì để 800 / 800.\r\n"
+        L"\r\n"
+        L"3) Tab \"Test\" — xem chuột thật so với chuột sau engine\r\n"
+        L"   • \"Tỉ lệ ra / vào\" quanh 1.00x–1.50x là bình thường. Quá 3x là bất thường.\r\n"
+        L"   • Nút \"Bấm thử vào đây\" để chắc chắn click vẫn hoạt động khi engine bật.\r\n"
+        L"\r\n"
+        L"4) Tab \"Chuột\" — cài đặt chuột của Windows (tốc độ con trỏ, double-click, cuộn, vệt chuột).\r\n"
+        L"   Độc lập với Engine. Khi Engine bật, app tạm đặt tốc độ 10 + tắt precision rồi tự trả lại khi tắt.\r\n"
+        L"\r\n"
+        L"5) Tab \"Tối ưu\", \"Config\", \"ADB\", \"Root\" — dành cho BlueStacks (cần Admin / ADB).\r\n"
+        L"   Tab \"Presets\" lưu/nạp bộ tuỳ chọn của tab Tối ưu.\r\n"
+        L"\r\n"
+        L"AN TOÀN\r\n"
+        L"   • Engine tự ngắt nếu thấy chuột chạy bất thường (có thể tắt bảo vệ ở tab Test — không khuyên).\r\n"
+        L"   • Thoát app là chuột được trả về cài đặt Windows gốc.\r\n"
+        L"   • Mouse Forge chỉ xử lý chuyển động chuột thô. KHÔNG đọc bộ nhớ hay hình ảnh của game/giả lập,\r\n"
+        L"     không tự ngắm, không tự bù giật.\r\n"
+        L"   • Nút góc trên bên phải đổi giao diện Sáng / Tối. Cài đặt lưu ở file MouseForge.ini cạnh file .exe.\r\n",
+        WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+        px, py, 800, 440, hwnd, (HMENU)(INT_PTR)IDC_GUIDE_TEXT, g.hInst, nullptr);
+    g.tabControls[10] = { g.guideText };
+    SendMessageW(g.guideText, WM_SETFONT, (WPARAM)g.hFontUI, TRUE);
+
     // ---- Log box ----
     g.hLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-        10, 520, 860, 150, hwnd, (HMENU)(INT_PTR)IDC_LOG, g.hInst, nullptr);
+        10, 620, 860, 150, hwnd, (HMENU)(INT_PTR)IDC_LOG, g.hInst, nullptr);
     SendMessageW(g.hLog, WM_SETFONT, (WPARAM)g.hFontMono, TRUE);
 
-    // ---- Status bar ----
-    g.hStatus = CreateWindowExW(0, STATUSCLASSNAMEW, L"", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
-        0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_STATUS, g.hInst, nullptr);
-    SendMessageW(g.hStatus, SB_SETTEXT, 0, (LPARAM)L"Sẵn sàng");
-
-    EnumChildWindows(hwnd, FlattenButtonsProc, 0);
-
+    // Đồng bộ UI Engine theo cài đặt đã lưu, áp theme, hiện tab đầu tiên
+    SyncEngineUiFromState();
+    UpdateEngineUi();
+    ApplyTheme();
     ShowTabPage(0);
 }
 
@@ -2137,6 +2777,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         RefreshPresetCombo();
         OnMouseRefresh();
         RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT, VK_F7);
+        SetTimer(hwnd, kTimerStats, 250, nullptr);
         log_line(L"[App] Mouse Forge đã khởi động");
         if (!g.admin) {
             log_line(L"[App] cảnh báo: chưa chạy với quyền Administrator, ghi config/priority sẽ bị chặn");
@@ -2203,7 +2844,40 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             case IDC_ENG_RESET:      OnEngReset(); break;
             case IDC_ENG_REFDPI:     if (code == EN_CHANGE) EngineSyncFromControls(); break;
             case IDC_ENG_CURDPI:     if (code == EN_CHANGE) EngineSyncFromControls(); break;
-            default: break;
+            case IDC_THEME_TOGGLE:
+                g_dark = !g_dark;
+                ApplyTheme();
+                SaveSettings();
+                break;
+            case IDC_QS_TOGGLE:
+                EngineSetEnabled(!g_engine.enabled.load(), L"(từ tab Bắt đầu)");
+                break;
+            case IDC_TEST_RESET:
+                g_engine.stIn = g_engine.stOut = 0.0;
+                g_engine.stEvents = 0;
+                g.testClicks = 0;
+                if (g.testClickPad) SetWindowTextW(g.testClickPad, L"Bấm thử vào đây\nSố click: 0");
+                log_line(L"[Test] đã đặt lại số liệu đo");
+                break;
+            case IDC_TEST_WATCHDOG:
+                g_engine.watchdogOn = SendMessageW(g.testWatchdog, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                log_line(g_engine.watchdogOn ? L"[Test] đã BẬT bộ bảo vệ chống chuột mất kiểm soát"
+                                             : L"[Test] đã TẮT bộ bảo vệ (không khuyến khích)");
+                break;
+            case IDC_TEST_CLICKPAD:
+                g.testClicks++;
+                if (g.testClickPad) {
+                    SetWindowTextW(g.testClickPad,
+                        (L"Bấm thử vào đây\nSố click: " + std::to_wstring(g.testClicks)).c_str());
+                }
+                break;
+            default:
+                if (id >= IDC_QS_P1 && id <= IDC_QS_P5) {
+                    OnQuickPreset(id - IDC_QS_P1);
+                } else if (id >= IDC_TABBTN_BASE && id < IDC_TABBTN_BASE + AppGlobals::TAB_COUNT) {
+                    ShowTabPage(id - IDC_TABBTN_BASE);
+                }
+                break;
         }
         break;
     }
@@ -2218,33 +2892,36 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         }
         break;
     }
-    case WM_CTLCOLORSTATIC: {
-        HDC hdc = (HDC)wParam;
-        HWND ctl = (HWND)lParam;
-        if (ctl == g.hHeaderPanel) {
-            return (LRESULT)g.hBrushHeader;
-        }
-        if (ctl == g.hHeaderTitle) {
-            SetTextColor(hdc, RGB(15, 55, 115));
-            SetBkMode(hdc, TRANSPARENT);
-            return (LRESULT)g.hBrushHeader;
-        }
-        if (ctl == g.hHeaderSub) {
-            SetTextColor(hdc, RGB(80, 95, 120));
-            SetBkMode(hdc, TRANSPARENT);
-            return (LRESULT)g.hBrushHeader;
-        }
-        // Mọi STATIC khác (nhãn trong các tab): nền đồng bộ với màu cửa sổ, chữ trong suốt
-        SetBkMode(hdc, TRANSPARENT);
-        return (LRESULT)g.hBrushWindow;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+        return ThemeCtlColor(msg, (HDC)wParam, (HWND)lParam);
+    case WM_ERASEBKGND: {
+        RECT rc; GetClientRect(hwnd, &rc);
+        FillRect((HDC)wParam, &rc, BrBg());
+        return 1;
     }
+    case WM_PAINT:
+        PaintMain(hwnd);
+        return 0;
+    case WM_DRAWITEM:
+        DrawOwnerButton((const DRAWITEMSTRUCT*)lParam);
+        return TRUE;
+    case WM_TIMER:
+        if (wParam == kTimerFlush) MouseEngine_Flush();
+        else if (wParam == kTimerStats) UpdateTestTab();
+        return 0;
     case WM_INPUT: {
         if (g_engine.enabled.load()) {
             RAWINPUT raw{};
             UINT dwSize = sizeof(raw);
             UINT got = GetRawInputData((HRAWINPUT)lParam, RID_INPUT, &raw, &dwSize, sizeof(RAWINPUTHEADER));
-            // hDevice == NULL nghĩa là sự kiện do SendInput bơm vào (chính engine) -> bỏ qua, tránh vòng lặp vô hạn
-            if (got != (UINT)-1 && raw.header.dwType == RIM_TYPEMOUSE && raw.header.hDevice != nullptr) {
+            // QUAN TRỌNG: hDevice có thể KHÁC NULL ngay cả với sự kiện do chính SendInput bơm ra (tuỳ driver/máy) —
+            // dựa vào hDevice để lọc là nguyên nhân gây vòng lặp tự khuếch đại (chuột "bay"/mất kiểm soát).
+            // ulExtraInformation mới là cách đáng tin cậy: engine luôn gắn kInjectTag khi tự bơm (xem EngineSendMove/
+            // MouseEngine_ForwardButtons), nên chỉ cần so khớp đúng tag này để bỏ qua sự kiện do chính mình tạo ra.
+            bool isSelfInjected = (raw.data.mouse.ulExtraInformation == kInjectTag);
+            if (got != (UINT)-1 && raw.header.dwType == RIM_TYPEMOUSE && !isSelfInjected) {
                 if (!(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
                     MouseEngine_ProcessAndInject(raw.data.mouse.lLastX, raw.data.mouse.lLastY);
                 }
@@ -2252,6 +2929,22 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             }
         }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+    case WM_APP_TRIP: {
+        // Bộ bảo vệ (watchdog) vừa tự phát hiện chuyển động bất thường và đã tắt cờ enabled ngay lập tức
+        // (nên KHÔNG còn tự khuếch đại thêm nữa). Nhưng raw input vẫn đang đăng ký RIDEV_NOLEGACY, nếu không
+        // gỡ ra ở đây thì Windows vẫn bị chặn xử lý chuột mặc định -> con trỏ đứng hình hoàn toàn. Phải gọi
+        // EngineSetEnabled(false, ...) để: gỡ đăng ký raw input, khôi phục cài đặt chuột gốc của Windows,
+        // và đồng bộ lại checkbox/nút Bắt đầu về trạng thái TẮT.
+        EngineSetEnabled(false,
+            L"(bộ bảo vệ tự động tắt vì phát hiện chuyển động bất thường — có thể do vòng lặp phản hồi hoặc phần cứng lỗi)",
+            true);
+        MessageBoxW(hwnd,
+            L"Mouse Engine đã tự động TẮT vì phát hiện chuyển động chuột bất thường.\n\n"
+            L"Chuột của bạn đã được trả về mặc định Windows và hoạt động bình thường trở lại.\n"
+            L"Vào tab \"Engine\" hoặc \"Bắt đầu\" nếu muốn bật lại.",
+            L"Mouse Forge — Bộ bảo vệ đã kích hoạt", MB_OK | MB_ICONWARNING);
+        return 0;
     }
     case WM_HOTKEY:
         // Phím tắt cứu hộ Ctrl+Alt+F7: tắt engine ngay kể cả khi chuột đang không dùng được
@@ -2267,10 +2960,13 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_DESTROY:
         // An toàn: nếu Mouse Engine đang bật, luôn trả lại chuột mặc định Windows trước khi thoát.
         UnregisterHotKey(hwnd, 1);
+        KillTimer(hwnd, kTimerFlush);
+        KillTimer(hwnd, kTimerStats);
         if (g_engine.enabled.load() || g_engine.rawRegistered) {
             g_engine.enabled = false;
             MouseEngine_Unregister(hwnd);
         }
+        SaveSettings();
         PostQuitMessage(0);
         return 0;
     }
@@ -2281,9 +2977,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     g.hInst = hInstance;
 
-    // Tạo brush màu trước khi đăng ký window class (cần cho wc.hbrBackground)
-    g.hBrushHeader = CreateSolidBrush(RGB(226, 236, 250));
-    g.hBrushWindow = CreateSolidBrush(RGB(244, 246, 249));
+    // Nạp cài đặt đã lưu (theme + thông số engine) TRƯỚC khi tạo brush/cửa sổ,
+    // để wc.hbrBackground và giao diện ban đầu dùng đúng theme đã lưu.
+    LoadSettings();
+    CreateThemeBrushes();
 
     INITCOMMONCONTROLSEX icc{};
     icc.dwSize = sizeof(icc);
@@ -2296,7 +2993,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     wc.lpfnWndProc = MainWndProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = g.hBrushWindow;
+    wc.hbrBackground = BrBg();
     wc.lpszClassName = L"MouseForgeMainWnd";
     wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(101));
     if (!RegisterClassExW(&wc)) return 0;
@@ -2307,7 +3004,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     wcDlg.lpfnWndProc = EditKeyDlgProc;
     wcDlg.hInstance = hInstance;
     wcDlg.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wcDlg.hbrBackground = g.hBrushWindow;
+    wcDlg.hbrBackground = BrBg();
     wcDlg.lpszClassName = L"MFEditKeyDlg";
     if (!RegisterClassExW(&wcDlg)) return 0;
 
@@ -2321,12 +3018,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         nullptr, nullptr, hInstance, nullptr);
 
     if (!hwnd) return 0;
-
-    // Windows 11: tô màu caption bar đồng bộ với banner header của app (bỏ qua lỗi nếu chạy trên bản Windows cũ hơn)
-    COLORREF capColor = RGB(226, 236, 250);
-    COLORREF textColor = RGB(15, 55, 115);
-    DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &capColor, sizeof(capColor));
-    DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &textColor, sizeof(textColor));
+    // (Caption bar Windows 11 đã được tô đúng theme bởi ApplyTheme() gọi từ CreateMainControls ở trên.)
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);

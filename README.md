@@ -31,7 +31,21 @@ windres resource.rc -O coff -o resource.res
 g++ -std=c++17 -O2 -municode -mwindows MouseForge.cpp resource.res -o MouseForge.exe -lshlwapi -lpsapi -lcomctl32 -lgdi32 -luser32 -ldwmapi -ladvapi32
 ```
 
-## Tab "Engine" (mới)
+## v3 — sửa 2 lỗi nghiêm trọng + giao diện mới
+**2 lỗi khiến chuột mất kiểm soát/siêu nhanh đã được sửa:**
+1. **Vòng lặp tự khuếch đại**: bộ lọc nhận diện sự kiện do chính engine bơm ra (`SendInput`) dựa vào `hDevice != NULL`, nhưng giá trị này **không đáng tin cậy** — trên một số máy, sự kiện do `SendInput` tạo vẫn báo `hDevice` khác NULL, khiến engine đọc lại chính chuyển động nó vừa bơm ra rồi khuếch đại tiếp qua đường cong gia tốc → tăng theo cấp số nhân trong vài phần nghìn giây → chuột "bay" mất kiểm soát. Đã sửa: dùng `ulExtraInformation` (tag riêng gắn vào mọi sự kiện engine tự bơm) để nhận diện chính xác 100%.
+2. **Chuột đứng hình sau khi bộ bảo vệ (watchdog) tự kích hoạt**: watchdog phát hiện đúng chuyển động bất thường và tắt cờ engine, nhưng thông điệp báo cho luồng giao diện lại **không có nơi xử lý**, nên `RIDEV_NOLEGACY` (chặn Windows xử lý chuột mặc định) không được gỡ — kết quả là chuột đứng yên hoàn toàn thay vì trả về bình thường. Đã thêm handler xử lý đúng: gỡ đăng ký raw input, khôi phục cài đặt chuột gốc, đồng bộ lại checkbox, và hiện hộp thoại báo cho người dùng biết chuột đã ổn định trở lại.
+
+Phím cứu hộ **Ctrl+Alt+F7** luôn tắt engine ngay lập tức trong mọi trường hợp.
+
+**Giao diện mới**: thanh tab tự vẽ (owner-drawn) hiện đại hơn control gốc của Windows, hỗ trợ dark mode, lưu cài đặt (`MouseForge.ini`) giữa các lần mở app.
+
+**Tab mới, dễ dùng hơn cho người không rành kỹ thuật:**
+- **Bắt đầu** — 5 nút chọn nhanh kiểu chuột dựng sẵn (Chính xác 1:1 / Mượt & ổn định / Cân bằng / Xoay nhanh / Về mặc định Windows), 2 bước là xong.
+- **Test** — đo trực tiếp tốc độ chuột thật so với sau khi qua engine, có ô test riêng.
+- **Hướng dẫn** — giải thích từng thông số bằng ngôn ngữ đơn giản.
+
+## Tab "Engine"
 Đăng ký raw mouse input (`RIDEV_NOLEGACY`) để tự xử lý delta chuột thô trước khi Windows di chuyển con trỏ, rồi bơm chuyển động đã xử lý bằng `SendInput` — đúng kỹ thuật RawAccel dùng, **không đọc bộ nhớ/pixel của bất kỳ tiến trình game nào**:
 - **EMA Fast**: bộ lọc làm mượt rung tay (time-normalized exponential moving average)
 - **Velocity Window**: số mẫu tốc độ dùng để tính trung bình trượt
